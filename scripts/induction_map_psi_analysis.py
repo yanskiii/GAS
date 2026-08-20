@@ -108,6 +108,74 @@ def load_long_data(path: str) -> pd.DataFrame:
     return df
 
 
+# --------------------------------------------------------------------------- #
+# Direct loading from the master file-path lists (no combined csv needed).
+# Mirrors the MASTER_combined build step, vectorized.
+# --------------------------------------------------------------------------- #
+
+def read_filepath_list(master: str) -> list[str]:
+    """One file path per line; tolerate blanks/quotes/extra columns."""
+    paths = []
+    with open(master, "r") as fh:
+        for raw in fh:
+            first = raw.strip().split(",")[0].strip().strip('"').strip("'")
+            if first:
+                paths.append(first)
+    return paths
+
+
+def patient_id_from_path(path: str) -> str | None:
+    """The 14 characters starting at 'IU' in the path."""
+    i = path.find("IU")
+    return None if i == -1 else path[i:i + 14]
+
+
+def load_from_masters(btb_master: str, psi_master: str) -> pd.DataFrame:
+    """Build the long patientID/time/MAP/PSi table straight from the two
+    master lists of per-patient file paths (BTB MAP files + Sedline files)."""
+    frames = []
+
+    for p in read_filepath_list(btb_master):
+        pid = patient_id_from_path(p)
+        if pid is None:
+            sys.stderr.write(f"[WARN] no 'IU' id in path, skipped: {p}\n")
+            continue
+        try:
+            df = pd.read_csv(p, skipinitialspace=True)
+            df.columns = df.columns.str.strip()
+            good = df[pd.to_numeric(df["databad"], errors="coerce") == 0]
+            frames.append(pd.DataFrame({
+                "patientID": pid,
+                "time": good["time"].astype(str).str[-8:],
+                MAP_COL: pd.to_numeric(good["meanArterialPressure"], errors="coerce"),
+                PSI_COL: np.nan,
+            }))
+        except Exception as exc:
+            sys.stderr.write(f"[WARN] {pid} (BTB): {exc} — skipped\n")
+
+    for p in read_filepath_list(psi_master):
+        pid = patient_id_from_path(p)
+        if pid is None:
+            sys.stderr.write(f"[WARN] no 'IU' id in path, skipped: {p}\n")
+            continue
+        try:
+            df = pd.read_csv(p, skipinitialspace=True)
+            df.columns = df.columns.str.strip()  # fixes the ' Time' leading space
+            frames.append(pd.DataFrame({
+                "patientID": pid,
+                "time": df["Time"].astype(str).str[-8:],
+                MAP_COL: np.nan,
+                PSI_COL: pd.to_numeric(df["PSi (Sedline) Value"], errors="coerce"),
+            }))
+        except Exception as exc:
+            sys.stderr.write(f"[WARN] {pid} (Sedline): {exc} — skipped\n")
+
+    if not frames:
+        raise ValueError("Nothing loaded from the master file lists.")
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.sort_values(["patientID", "time"]).reset_index(drop=True)
+
+
 def load_events(path: str | None) -> dict:
     """Events per patient: induction_time, preop_start, sqi_time (HH:MM:SS)."""
     if path is None:
@@ -345,9 +413,15 @@ def fig_lag_sensitivity(raw: pd.DataFrame, events: dict, outdir: str) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Induction-aligned MAP vs PSi analysis.")
-    ap.add_argument("--data", required=True,
+    ap.add_argument("--data", default=None,
                     help="Long-format data file (xlsx or csv): patientID,time,"
-                         f"{MAP_COL},{PSI_COL}")
+                         f"{MAP_COL},{PSI_COL}. Alternative to --btb/--psi.")
+    ap.add_argument("--btb", default=None,
+                    help="Master csv listing each patient's BTB MAP file path "
+                         "(one per line). Use together with --psi.")
+    ap.add_argument("--psi", default=None,
+                    help="Master csv listing each patient's Sedline file path "
+                         "(one per line). Use together with --btb.")
     ap.add_argument("--events", default=None,
                     help="csv with patientID,induction_time,preop_start,sqi_time "
                          "(defaults to the two sample patients).")
@@ -358,7 +432,14 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     os.makedirs(args.outdir, exist_ok=True)
-    raw = load_long_data(args.data)
+    if args.btb and args.psi:
+        raw = load_from_masters(args.btb, args.psi)
+        print(f"Loaded {raw['patientID'].nunique()} patients from master lists "
+              f"({raw[MAP_COL].notna().sum()} MAP, {raw[PSI_COL].notna().sum()} PSi values)")
+    elif args.data:
+        raw = load_long_data(args.data)
+    else:
+        ap.error("provide either --data, or both --btb and --psi")
     events = load_events(args.events)
 
     aligned, met_rows = {}, []
