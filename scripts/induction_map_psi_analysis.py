@@ -176,19 +176,72 @@ def load_from_masters(btb_master: str, psi_master: str) -> pd.DataFrame:
     return combined.sort_values(["patientID", "time"]).reset_index(drop=True)
 
 
+# The REDCap export's column labels (matched loosely: lowercase substring, so
+# minor wording/typo fixes in future exports still match).
+REDCAP_ID_COL = "screening id"
+REDCAP_COLS = {
+    "induction_time": "what time was induction",
+    "preop_start": "time monitoring started in preop",
+    "sqi_time": "sqi>3 bars in preop",
+}
+
+
 def load_events(path: str | None) -> dict:
-    """Events per patient: induction_time, preop_start, sqi_time (HH:MM:SS)."""
+    """Events per patient: induction_time, preop_start, sqi_time.
+
+    Accepts EITHER format and auto-detects which one it got:
+      1. simple csv:  patientID,induction_time,preop_start,sqi_time
+      2. the REDCap DATA_LABELS export: patient id in 'Screening ID', times in
+         the long question-label columns (see REDCAP_COLS above).
+    """
     if path is None:
         return dict(DEFAULT_EVENTS)
     ev = pd.read_csv(path)
+
+    # Format 1: the simple hand-made events csv.
+    if "induction_time" in ev.columns:
+        out = {}
+        for _, r in ev.iterrows():
+            out[str(r["patientID"]).strip()] = {
+                "induction_time": str(r["induction_time"]).strip(),
+                "preop_start": str(r.get("preop_start", "")).strip(),
+                "sqi_time": str(r.get("sqi_time", "")).strip(),
+            }
+        return out
+
+    # Format 2: REDCap export — find columns by (case-insensitive) substring.
+    lower = {str(c).strip().lower(): c for c in ev.columns}
+
+    def find_col(fragment: str) -> str | None:
+        for lc, orig in lower.items():
+            if fragment in lc:
+                return orig
+        return None
+
+    id_col = find_col(REDCAP_ID_COL)
+    time_cols = {key: find_col(frag) for key, frag in REDCAP_COLS.items()}
+    if id_col is None or time_cols["induction_time"] is None:
+        raise ValueError(
+            f"Could not recognize the events file '{path}': it has neither an "
+            f"'induction_time' column (simple format) nor REDCap columns like "
+            f"'Screening ID' / 'What time was INDUCTION...'."
+        )
+
     out = {}
     for _, r in ev.iterrows():
-        out[str(r["patientID"]).strip()] = {
-            "induction_time": str(r["induction_time"]).strip(),
-            "preop_start": str(r.get("preop_start", "")).strip(),
-            "sqi_time": str(r.get("sqi_time", "")).strip(),
-        }
-    return out
+        pid = str(r[id_col]).strip()
+        if not pid or pid.lower() == "nan":
+            continue
+        entry = {}
+        for key, col in time_cols.items():
+            val = str(r[col]).strip() if col is not None and pd.notna(r[col]) else ""
+            entry[key] = "" if val.lower() == "nan" else val
+        # REDCap can export a patient across several rows; keep the first row
+        # that actually has an induction time.
+        if pid not in out or (not out[pid]["induction_time"] and entry["induction_time"]):
+            out[pid] = entry
+    # Drop patients with no induction time at all (alignment impossible).
+    return {pid: e for pid, e in out.items() if e["induction_time"]}
 
 
 def align_patient(g: pd.DataFrame, induction_sec: float,
