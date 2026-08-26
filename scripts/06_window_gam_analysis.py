@@ -942,8 +942,10 @@ def parse_args():
         help="20秒对齐的多模态时序 CSV。")
     parser.add_argument(
         "--covariates", type=Path,
+        default=Path("/N/project/Analgesia_BDproject/ZZ/EEG_multimodal_prep/"
+                     "06_analysis_ready/psi_gamm_minute_data_current.csv.gz"),
         help="分钟级药物 + 静态协变量 CSV（需含 subject_id 与 minute 两列）。"
-             "没有默认值：该文件的位置因项目而异，必须显式给出。")
+             "默认使用 06_analysis_ready 下的 psi_gamm_minute_data_current。")
     parser.add_argument(
         "--redcap", type=Path,
         default=Path("/N/project/Analgesia_BDproject/PR/data/"
@@ -977,13 +979,6 @@ def main():
     if args.assemble_fine:
         assemble_fine(args.output)
         return
-    if not args.covariates:
-        raise SystemExit(
-            "拟合时必须提供 --covariates（分钟级药物/静态协变量 CSV）。\n"
-            "  --timeseries、--redcap、--output 已有默认值，可省略。\n"
-            "  例：python example.py --covariates /path/to/covariates.csv "
-            "--window ward_preop"
-        )
     missing_files = [
         str(path) for path in (args.timeseries, args.covariates, args.redcap)
         if not Path(path).is_file()
