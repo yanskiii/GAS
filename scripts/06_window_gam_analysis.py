@@ -363,15 +363,6 @@ def load_timepoint_data(timeseries_path: Path, covariate_path: Path, redcap_path
             "REDCap 中找不到术前监测起止时间列；ward_preop 窗口无法构建。"
         )
 
-    # 只取需要的三列另建小表，避免往 740 列的宽表里反复插列。
-    redcap = pd.DataFrame({
-        "_start": pd.to_datetime(redcap[start_col], errors="coerce"),
-        "_end": pd.to_datetime(redcap[end_col], errors="coerce"),
-        **{column: redcap[column] for column in redcap.columns},
-    })
-    redcap["preop_start"] = redcap.pop("_start")
-    redcap["preop_end"] = redcap.pop("_end")
-
     # 研究 ID 形如 IUMH2026030501，pd.to_numeric 会把它整列变成 NaN，
     # 于是合并不上、preop 时间全空、ward_preop 窗口一个点都没有。
     # 因此优先按研究 ID 合并，只有在确实是数字编号时才退回 screening_id。
@@ -384,10 +375,23 @@ def load_timepoint_data(timeseries_path: Path, covariate_path: Path, redcap_path
         None,
     )
 
+    # 只从 740 列的宽表里取需要的几列，一次性组成小表；
+    # 逐列往宽表里插会触发 PerformanceWarning（DataFrame 高度碎片化）。
+    redcap = pd.DataFrame({
+        "preop_start": pd.to_datetime(redcap[start_col], errors="coerce"),
+        "preop_end": pd.to_datetime(redcap[end_col], errors="coerce"),
+        **(
+            {"subject_id": apply_id_aliases(
+                normalize_subject_id(redcap[id_col]))}
+            if id_col is not None else {}
+        ),
+        **(
+            {"Screening ID": redcap["Screening ID"]}
+            if id_col is None and "Screening ID" in redcap.columns else {}
+        ),
+    })
+
     if id_col is not None:
-        redcap["subject_id"] = apply_id_aliases(
-            normalize_subject_id(redcap[id_col])
-        )
         lookup = (
             redcap.loc[redcap["subject_id"].notna(),
                        ["subject_id", "preop_start", "preop_end"]]
