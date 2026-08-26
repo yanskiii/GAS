@@ -886,10 +886,25 @@ def assemble_fine(output_root: Path):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--timeseries", type=Path)
-    parser.add_argument("--covariates", type=Path)
-    parser.add_argument("--redcap", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--timeseries", type=Path,
+        default=Path("/N/project/Analgesia_BDproject/PR/data/"
+                     "analysis_timeseries_20s.csv"),
+        help="20秒对齐的多模态时序 CSV。")
+    parser.add_argument(
+        "--covariates", type=Path,
+        help="分钟级药物 + 静态协变量 CSV（需含 subject_id 与 minute 两列）。"
+             "没有默认值：该文件的位置因项目而异，必须显式给出。")
+    parser.add_argument(
+        "--redcap", type=Path,
+        default=Path("/N/project/Analgesia_BDproject/data/00_raw/BDFILES/"
+                     "REDCap/6.16.26.FIXED-TYPOS-BDPostInductionHemod_"
+                     "DATA_LABELS_2026-06-16_1657.csv"),
+        help="REDCap 导出（含术前监测起止时间）。")
+    parser.add_argument(
+        "--output", type=Path,
+        default=Path("/N/project/Analgesia_BDproject/PR/figures/window_gam"),
+        help="结果输出目录。")
     parser.add_argument("--window", choices=[x["key"] for x in WINDOWS])
     parser.add_argument("--window-index", type=int)
     parser.add_argument("--bootstrap-unit", choices=["patient", "row"], default="patient")
@@ -913,8 +928,27 @@ def main():
     if args.assemble_fine:
         assemble_fine(args.output)
         return
-    if not args.timeseries or not args.covariates or not args.redcap:
-        raise SystemExit("拟合时必须提供 --timeseries、--covariates 和 --redcap")
+    if not args.covariates:
+        raise SystemExit(
+            "拟合时必须提供 --covariates（分钟级药物/静态协变量 CSV）。\n"
+            "  --timeseries、--redcap、--output 已有默认值，可省略。\n"
+            "  例：python example.py --covariates /path/to/covariates.csv "
+            "--window ward_preop"
+        )
+    missing_files = [
+        str(path) for path in (args.timeseries, args.covariates, args.redcap)
+        if not Path(path).is_file()
+    ]
+    if missing_files:
+        raise SystemExit(
+            "以下输入文件不存在，请检查路径：\n  " + "\n  ".join(missing_files)
+        )
+    if not args.window and args.window_index is None and not args.all:
+        raise SystemExit(
+            "必须指定要拟合的窗口：--window <名称>、--window-index <序号> "
+            "或 --all（全部15个窗口）。\n"
+            f"  可选窗口：{', '.join(x['key'] for x in WINDOWS)}"
+        )
     if args.all:
         for spec in WINDOWS[args.start_index:]:
             fit_window(args.timeseries, args.covariates, args.redcap, spec, args.output, args.bootstrap_unit)
