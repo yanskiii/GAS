@@ -33,7 +33,7 @@ import pandas as pd
 
 WINDOWS = [
     ("pre_induction", "Pre-induction\n(preop, outside OR)"),
-    ("no_psi", "No PSI\n(post-induction, before PSI)"),
+    ("or_pre_induction", "Pre-induction\n(in OR)"),
     ("post_0_5", "Post-induction\n0-5 min"),
     ("post_5_10", "Post-induction\n5-10 min"),
     ("post_10_20", "Post-induction\n10-20 min"),
@@ -195,6 +195,7 @@ def choose_redcap_rows(
     lookup["_complete"] = (
         lookup["preop_start"].notna().astype(int)
         + lookup["preop_end"].notna().astype(int)
+        + lookup["or_entry"].notna().astype(int)
     )
 
     complete_intervals = (
@@ -235,6 +236,7 @@ def choose_redcap_rows(
             key,
             "preop_start",
             "preop_end",
+            "or_entry",
         ]
     ]
 
@@ -248,12 +250,12 @@ def load_data(
         low_memory=False,
     )
 
+    # PSI is reported for context only - it never filters or categorizes.
     required = {
         "subject_id",
         "timestamp_local",
         "map",
         "sto2_mean",
-        "psi_median",
         "seconds_from_induction",
     }
 
@@ -273,6 +275,9 @@ def load_data(
         data["timestamp_local"],
         errors="coerce",
     )
+
+    if "psi_median" not in data.columns:
+        data["psi_median"] = pd.NA
 
     for column in [
         "map",
@@ -308,6 +313,20 @@ def load_data(
         "Time that monitoring ended in preop:",
     )
 
+    # Panel 2 boundary: when the patient entered the OR.
+    try:
+        or_entry_column = find_redcap_column(
+            redcap_raw,
+            "What time did the patient enter the OR?",
+        )
+    except ValueError:
+        or_entry_column = None
+        print(
+            "\nWARNING: No 'What time did the patient enter the OR?' column "
+            "found. The in-OR pre-induction panel will fall back to "
+            "'pre-induction and not inside the preop window'."
+        )
+
     id_column = find_redcap_id_column(redcap_raw)
 
     if id_column is not None:
@@ -323,6 +342,14 @@ def load_data(
                 "preop_end": pd.to_datetime(
                     redcap_raw[preop_end_column],
                     errors="coerce",
+                ),
+                "or_entry": (
+                    pd.to_datetime(
+                        redcap_raw[or_entry_column],
+                        errors="coerce",
+                    )
+                    if or_entry_column
+                    else pd.NaT
                 ),
             }
         )
@@ -362,6 +389,14 @@ def load_data(
                     redcap_raw[preop_end_column],
                     errors="coerce",
                 ),
+                "or_entry": (
+                    pd.to_datetime(
+                        redcap_raw[or_entry_column],
+                        errors="coerce",
+                    )
+                    if or_entry_column
+                    else pd.NaT
+                ),
             }
         )
 
@@ -387,8 +422,6 @@ def load_data(
         & data["sto2_mean"].between(STO2_MIN, STO2_MAX)
         & data["brain_bilateral_usable"].eq(1)
     )
-
-    data["valid_psi"] = data["psi_median"].between(0, 100)
 
     return data
 
@@ -454,6 +487,48 @@ def preop_time_mask(data: pd.DataFrame) -> pd.Series:
     return time_match & pre_induction_or_unknown
 
 
+def _clock_seconds(values: pd.Series) -> pd.Series:
+    """Time-of-day, in seconds since midnight."""
+
+    return (
+        values.dt.hour * 3600
+        + values.dt.minute * 60
+        + values.dt.second
+    )
+
+
+def or_entry_seconds_from_induction(data: pd.DataFrame) -> pd.Series:
+    """OR-entry time expressed as seconds from induction (negative).
+
+    REDCap stores a clock time, so it is anchored against each patient's
+    induction datetime, which is recovered from the timeseries itself
+    (timestamp_local minus seconds_from_induction). Differences are wrapped
+    into +/-12 h so a case spanning midnight still works.
+    """
+
+    if "or_entry" not in data.columns:
+        return pd.Series(np.nan, index=data.index, dtype=float)
+
+    induction_timestamp = (
+        data["timestamp_local"]
+        - pd.to_timedelta(data["seconds_from_induction"], unit="s")
+    )
+
+    induction_timestamp = induction_timestamp.groupby(
+        data["subject_id"]
+    ).transform("median")
+
+    delta = (
+        _clock_seconds(data["or_entry"])
+        - _clock_seconds(induction_timestamp)
+    )
+
+    # Wrap into (-12 h, +12 h].
+    delta = ((delta + 43200) % 86400) - 43200
+
+    return delta.astype(float)
+
+
 def assign_windows(data: pd.DataFrame) -> pd.DataFrame:
     """
     Assign observations to plots.
@@ -475,28 +550,28 @@ def assign_windows(data: pd.DataFrame) -> pd.DataFrame:
     preop_data = data.loc[preop_plottable].copy()
     preop_data["panel"] = "pre_induction"
 
-    first_psi = (
-        data.loc[
-            data["valid_psi"] & induction.ge(0),
-            ["subject_id", "seconds_from_induction"],
-        ]
-        .groupby("subject_id")["seconds_from_induction"]
-        .min()
-    )
+    # Panel 2: in the OR, before induction. Purely a time window - PSI is
+    # never used to include, exclude or categorize an observation.
+    or_entry_rel = or_entry_seconds_from_induction(data)
+
+    in_or_pre_induction = induction.lt(0) & ~preop_match
+
+    # Where OR-entry is recorded, start the window there; where it is missing,
+    # keep every pre-induction row that is not inside the preop window.
+    in_or_pre_induction &= or_entry_rel.isna() | induction.ge(or_entry_rel)
+
+    or_pre_data = data.loc[
+        in_or_pre_induction
+        & data["map"].between(MAP_MIN, MAP_MAX)
+        & data["sto2_mean"].between(STO2_MIN, STO2_MAX)
+    ].copy()
+    or_pre_data["panel"] = "or_pre_induction"
 
     filtered = data.loc[data["valid_map_sto2"]].copy()
 
     induction = filtered["seconds_from_induction"]
-    patient_first_psi = filtered["subject_id"].map(first_psi)
 
     panel_masks = {
-        "no_psi": (
-            induction.ge(0)
-            & (
-                patient_first_psi.isna()
-                | induction.lt(patient_first_psi)
-            )
-        ),
         "post_0_5": induction.between(
             0,
             300,
@@ -514,7 +589,7 @@ def assign_windows(data: pd.DataFrame) -> pd.DataFrame:
         ),
     }
 
-    panels = [preop_data]
+    panels = [preop_data, or_pre_data]
 
     for panel_name, mask in panel_masks.items():
         panel_data = filtered.loc[mask].copy()
@@ -588,6 +663,13 @@ def build_panel_audit(
 
     audit_source = loaded_data.copy()
     audit_source["_preop_time_match"] = preop_time_mask(audit_source)
+    audit_source["_or_entry_rel"] = or_entry_seconds_from_induction(
+        audit_source
+    )
+    audit_source["_pre_induction_in_or"] = (
+        audit_source["seconds_from_induction"].lt(0)
+        & ~audit_source["_preop_time_match"]
+    )
 
     induction = audit_source["seconds_from_induction"]
 
@@ -607,7 +689,11 @@ def build_panel_audit(
             lambda s: int(s.eq(1).sum()),
         ),
         rows_valid_map_sto2=("valid_map_sto2", "sum"),
-        rows_any_psi=("valid_psi", "sum"),
+        rows_pre_induction_in_or=("_pre_induction_in_or", "sum"),
+        has_or_entry=(
+            "_or_entry_rel",
+            lambda s: bool(s.notna().any()),
+        ),
         rows_post_induction=(
             "seconds_from_induction",
             lambda s: int(s.ge(0).sum()),
@@ -681,7 +767,7 @@ def _exclusion_reason(
             return "no timeseries rows inside the preop clock window"
         return "no in-range MAP+StO2 pair inside preop window"
 
-    if summary["rows_post_induction"] == 0:
+    if panel_key != "or_pre_induction" and summary["rows_post_induction"] == 0:
         return "no post-induction rows (induction time missing/unaligned)"
 
     if summary["rows_bilateral_usable"] == 0:
@@ -690,8 +776,13 @@ def _exclusion_reason(
     if summary["rows_valid_map_sto2"] == 0:
         return "no rows pass MAP+StO2 range AND bilateral-usable filter"
 
-    if panel_key == "no_psi":
-        return "PSI present from induction onward, so no pre-PSI rows exist"
+    if panel_key == "or_pre_induction":
+        if summary["rows_pre_induction_in_or"] == 0:
+            return (
+                "no pre-induction rows outside the preop window "
+                "(record starts at induction?)"
+            )
+        return "no in-range MAP+StO2 pair between OR entry and induction"
 
     return "no rows inside this time window (record too short?)"
 
@@ -730,6 +821,14 @@ def print_funnel(
     print(
         "  ... with >=1 post-induction row ............... "
         f"{int(per_patient['rows_post_induction'].gt(0).sum())}"
+    )
+    print(
+        "  ... with a REDCap OR-entry time ............... "
+        f"{int(per_patient['has_or_entry'].sum())}"
+    )
+    print(
+        "  ... with >=1 pre-induction row outside preop .. "
+        f"{int(per_patient['rows_pre_induction_in_or'].gt(0).sum())}"
     )
 
     print("\n" + "=" * 68)
