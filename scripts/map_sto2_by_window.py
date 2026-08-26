@@ -41,14 +41,129 @@ WINDOWS = [
 
 MAP_MIN, MAP_MAX = 20.0, 160.0
 STO2_MIN, STO2_MAX = 0.0, 100.0
-EXPECTED_FIRST_PATIENTS = 93
+# Research IDs excluded from the analysis by investigator decision.
+EXCLUDED_IDS = frozenset({
+    "IUMH2025121201",
+    "IUMH2026020301",
+    "IUMH2026031001",
+})
+
+# The study roster: every valid research ID. Anything in the timeseries that is
+# not on this roster is a data-entry problem, not a patient, so it is reported
+# rather than silently analysed. EXCLUDED_IDS are already removed here.
+COHORT_IDS = frozenset({
+    "IUMH2025120901",
+    "IUMH2025120902",
+    "IUMH2025121501",
+    "IUMH2025121801",
+    "IUMH2025122901",
+    "IUMH2025123001",
+    "IUMH2025123101",
+    "IUMH2025123102",
+    "IUMH2026010501",
+    "IUMH2026010601",
+    "IUMH2026010602",
+    "IUMH2026010901",
+    "IUMH2026011301",
+    "IUMH2026011302",
+    "IUMH2026011501",
+    "IUMH2026011502",
+    "IUMH2026011601",
+    "IUMH2026011602",
+    "IUMH2026012201",
+    "IUMH2026012301",
+    "IUMH2026012302",
+    "IUMH2026012701",
+    "IUMH2026012702",
+    "IUMH2026012901",
+    "IUMH2026012902",
+    "IUMH2026013001",
+    "IUMH2026013002",
+    "IUMH2026020501",
+    "IUMH2026021001",
+    "IUMH2026021002",
+    "IUMH2026021901",
+    "IUMH2026021902",
+    "IUMH2026022001",
+    "IUMH2026022401",
+    "IUMH2026030301",
+    "IUMH2026030302",
+    "IUMH2026030501",
+    "IUMH2026030502",
+    "IUMH2026030401",
+    "IUMH2026030602",
+    "IUMH2026030901",
+    "IUMH2026031002",
+    "IUMH2026031701",
+    "IUMH2026031702",
+    "IUMH2026031801",
+    "IUMH2026031901",
+    "IUMH2026031902",
+    "IUMH2026032001",
+    "IUMH2026032002",
+    "IUMH2026032401",
+    "IUMH2026040201",
+    "IUUH2026030601",
+    "IUUH2026030602",
+    "IUUH2026030603",
+    "IUUH2026030901",
+    "IUUH2026030902",
+    "IUMH2026041701",
+    "IUMH2026041702",
+    "IUMH2026042101",
+    "IUMH2026042102",
+    "IUMH2026042301",
+    "IUMH2026042401",
+    "IUMH2026042701",
+    "IUMH2026042702",
+    "IUMH2026042801",
+    "IUMH2026042802",
+    "IUMH2026050501",
+    "IUUH2026031001",
+    "IUMH2026050502",
+    "IUMH2026051201",
+    "IUMH2026051202",
+    "IUMH2026051203",
+    "IUMH2026051901",
+    "IUMH2026052001",
+    "IUMH2026052002",
+    "IUMH2026052101",
+    "IUUH2026042801",
+    "IUUH2026050601",
+    "IUUH2026050602",
+    "IUMH2026052201",
+    "IUMH2026052202",
+    "IUMH2026060101",
+    "IUMH2026060102",
+    "IUMH2026061601",
+    "IUMH2026061701",
+    "IUMH2026061702",
+    "IUMH2026061901",
+    "IUMH2026062301",
+    "IUMH2026062302",
+    "IUMH2026062501",
+    "IUMH2026062502",
+    "IUMH2026063001",
+    "IUMH2026063002",
+})
 
 # Known REDCap ID typos -> the true research ID. Without these the affected
-# patients fail the REDCap merge and vanish from the preop panel.
+# patients fail the REDCap merge and vanish from the preop panel. Every value
+# must be a member of COHORT_IDS.
 REDCAP_ID_ALIASES = {
     "IUMH202601601": "IUMH2026011601",
     "IUMH2026010601-20260105": "IUMH2026010501",
 }
+
+EXPECTED_FIRST_PATIENTS = len(COHORT_IDS)
+
+
+_BAD_ALIASES = set(REDCAP_ID_ALIASES.values()) - COHORT_IDS
+if _BAD_ALIASES:
+    raise ValueError(
+        f"REDCAP_ID_ALIASES point at IDs that are not on the roster: "
+        f"{sorted(_BAD_ALIASES)}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +212,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--no-roster-filter",
+        action="store_true",
+        help="Report roster mismatches but analyse every ID found, including "
+             "off-roster IDs and investigator-excluded patients.",
+    )
+
+    parser.add_argument(
         "--explain",
         action="store_true",
         help="Print the per-panel funnel and top exclusion reasons.",
@@ -129,6 +251,56 @@ def apply_id_aliases(values: pd.Series) -> pd.Series:
     }
 
     return values.replace(aliases)
+
+
+def reconcile_with_roster(
+    data: pd.DataFrame,
+    apply_filter: bool = True,
+) -> pd.DataFrame:
+    """Check the timeseries IDs against the study roster and report mismatches.
+
+    Nothing is dropped quietly: excluded patients, off-roster IDs and roster
+    patients with no data are all printed before any filtering happens.
+    """
+
+    present = set(data["subject_id"].dropna().unique())
+
+    excluded_present = sorted(present & EXCLUDED_IDS)
+    off_roster = sorted(present - COHORT_IDS - EXCLUDED_IDS)
+    missing_from_data = sorted(COHORT_IDS - present)
+
+    print("\n" + "=" * 68)
+    print("ROSTER RECONCILIATION")
+    print("=" * 68)
+    print(f"  roster size (after exclusions) ................ {len(COHORT_IDS)}")
+    print(f"  roster patients present in timeseries ........ {len(present & COHORT_IDS)}")
+    print(f"  roster patients with NO timeseries data ...... {len(missing_from_data)}")
+    print(f"  investigator-excluded IDs found .............. {len(excluded_present)}")
+    print(f"  IDs in data but NOT on roster ................ {len(off_roster)}")
+
+    if excluded_present:
+        print("\n  Excluded by investigator decision (dropped):")
+        for subject_id in excluded_present:
+            print(f"      {subject_id}")
+
+    if off_roster:
+        print(
+            "\n  NOT on the roster - likely ID typos. Add a "
+            "REDCAP_ID_ALIASES entry for any that are real patients:"
+        )
+        for subject_id in off_roster:
+            rows = int(data["subject_id"].eq(subject_id).sum())
+            print(f"      {subject_id}  ({rows} rows)")
+
+    if missing_from_data:
+        print("\n  On the roster but absent from the timeseries:")
+        for subject_id in missing_from_data:
+            print(f"      {subject_id}")
+
+    if not apply_filter:
+        return data
+
+    return data.loc[data["subject_id"].isin(COHORT_IDS)].copy()
 
 
 def find_redcap_column(
@@ -244,6 +416,7 @@ def choose_redcap_rows(
 def load_data(
     data_path: Path,
     redcap_path: Path,
+    roster_filter: bool = True,
 ) -> pd.DataFrame:
     data = pd.read_csv(
         data_path,
@@ -270,6 +443,8 @@ def load_data(
     data["subject_id"] = apply_id_aliases(
         normalize_subject_id(data["subject_id"])
     )
+
+    data = reconcile_with_roster(data, apply_filter=roster_filter)
 
     data["timestamp_local"] = pd.to_datetime(
         data["timestamp_local"],
@@ -966,6 +1141,7 @@ def main() -> int:
     loaded_data = load_data(
         args.data,
         args.redcap,
+        roster_filter=not args.no_roster_filter,
     )
 
     plotted_data = assign_windows(loaded_data)
