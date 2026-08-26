@@ -768,12 +768,28 @@ def panel_plot(items, value_file, output, kind):
     plt.close(fig)
 
 
+def completed_windows(output_root: Path, specs: list[dict]) -> list[dict]:
+    """只保留真正跑出结果的窗口，缺结果的窗口跳过并提示。"""
+    done, missing = [], []
+    for spec in specs:
+        if (output_root / spec["key"] / "model_summary.csv").is_file():
+            done.append(spec)
+        else:
+            missing.append(spec["key"])
+    if missing:
+        log(f"  跳过没有结果的窗口（{len(missing)} 个）：{', '.join(missing)}")
+    return done
+
+
 def assemble(output_root: Path):
     setup_plotting()
     figures = output_root / "figures"
     figures.mkdir(parents=True, exist_ok=True)
     summaries, curves, derivatives, scatters, contrasts = [], [], [], [], []
-    for spec in WINDOWS:
+    available = completed_windows(output_root, WINDOWS)
+    if not available:
+        raise RuntimeError("没有任何窗口produced结果，无法汇总。")
+    for spec in available:
         folder = output_root / spec["key"]
         summaries.append(pd.read_csv(folder / "model_summary.csv"))
         curves.append(pd.read_csv(folder / "adjusted_curve.csv"))
@@ -795,12 +811,17 @@ def assemble(output_root: Path):
         "surgery_0_5", "surgery_5_10", "surgery_10_15", "surgery_15_20",
         "surgery_20_25", "surgery_25_30", "surgery_30_60", "surgery_ge60",
     ]
-    main = [next(x for x in WINDOWS if x["key"] == key) for key in main_keys]
-    detail = [next(x for x in WINDOWS if x["key"] == key) for key in detail_keys]
-    panel_plot(main, "timepoint_scatter_20s.csv", figures / "01_main_stages_scatter.png", "scatter")
-    panel_plot(main, "adjusted_curve.csv", figures / "02_main_stages_gam.png", "gam")
-    panel_plot(detail, "timepoint_scatter_20s.csv", figures / "03_surgery_windows_scatter.png", "scatter")
-    panel_plot(detail, "adjusted_curve.csv", figures / "04_surgery_windows_gam.png", "gam")
+    ready = {spec["key"] for spec in available}
+    main = [x for x in WINDOWS if x["key"] in main_keys and x["key"] in ready]
+    detail = [x for x in WINDOWS if x["key"] in detail_keys and x["key"] in ready]
+    if not main or not detail:
+        log("  可用窗口不足，跳过部分汇总图。")
+    if main:
+        panel_plot(main, "timepoint_scatter_20s.csv", figures / "01_main_stages_scatter.png", "scatter")
+        panel_plot(main, "adjusted_curve.csv", figures / "02_main_stages_gam.png", "gam")
+    if detail:
+        panel_plot(detail, "timepoint_scatter_20s.csv", figures / "03_surgery_windows_scatter.png", "scatter")
+        panel_plot(detail, "adjusted_curve.csv", figures / "04_surgery_windows_gam.png", "gam")
 
     fig, ax = plt.subplots(figsize=(9, 6))
     colors = plt.cm.viridis(np.linspace(0.05, 0.95, len(detail)))
@@ -828,6 +849,9 @@ def assemble_coarse(output_root: Path):
     setup_plotting()
     coarse_keys = ["surgery_0_30", "surgery_30_60", "surgery_ge60"]
     coarse = [next(x for x in WINDOWS if x["key"] == key) for key in coarse_keys]
+    coarse = completed_windows(output_root, coarse)
+    if not coarse:
+        raise RuntimeError("这些窗口都没有结果，请先完成拟合。")
     figures = output_root / "figures"
     figures.mkdir(parents=True, exist_ok=True)
 
@@ -887,6 +911,9 @@ def assemble_fine(output_root: Path):
         "surgery_30_60", "surgery_ge60",
     ]
     fine = [next(x for x in WINDOWS if x["key"] == key) for key in fine_keys]
+    fine = completed_windows(output_root, fine)
+    if not fine:
+        raise RuntimeError("这些窗口都没有结果，请先完成拟合。")
     figures = output_root / "figures"
     figures.mkdir(parents=True, exist_ok=True)
 
@@ -998,9 +1025,32 @@ def main():
             f"  可选窗口：{', '.join(x['key'] for x in WINDOWS)}"
         )
     if args.all:
+        # 单个窗口失败（例如时序文件缺少该窗口的时间锚点列）不应该让
+        # 已经跑完的窗口白费：记录失败原因，继续跑剩下的窗口。
+        succeeded, failed = [], []
         for spec in WINDOWS[args.start_index:]:
-            fit_window(args.timeseries, args.covariates, args.redcap, spec, args.output, args.bootstrap_unit)
-        assemble(args.output)
+            try:
+                fit_window(args.timeseries, args.covariates, args.redcap,
+                           spec, args.output, args.bootstrap_unit)
+                succeeded.append(spec["key"])
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                failed.append((spec["key"], str(exc)))
+                log(f"\n  [跳过] 窗口 {spec['key']} 失败：{exc}\n")
+
+        log("\n" + "=" * 68)
+        log(f"全部窗口完成：成功 {len(succeeded)}，失败 {len(failed)}")
+        log("=" * 68)
+        for key in succeeded:
+            log(f"  [成功] {key}")
+        for key, reason in failed:
+            log(f"  [失败] {key}：{reason}")
+
+        if succeeded:
+            assemble(args.output)
+        else:
+            log("没有成功的窗口，跳过汇总。")
         return
     if args.window:
         spec = next(x for x in WINDOWS if x["key"] == args.window)
