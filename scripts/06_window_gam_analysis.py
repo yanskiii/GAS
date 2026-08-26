@@ -897,8 +897,8 @@ def parse_args():
              "没有默认值：该文件的位置因项目而异，必须显式给出。")
     parser.add_argument(
         "--redcap", type=Path,
-        default=Path("/N/project/Analgesia_BDproject/data/00_raw/BDFILES/"
-                     "REDCap/6.16.26.FIXED-TYPOS-BDPostInductionHemod_"
+        default=Path("/N/project/Analgesia_BDproject/PR/data/"
+                     "6.16.26.FIXED-TYPOS-BDPostInductionHemod_"
                      "DATA_LABELS_2026-06-16_1657.csv"),
         help="REDCap 导出（含术前监测起止时间）。")
     parser.add_argument(
