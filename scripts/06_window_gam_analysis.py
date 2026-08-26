@@ -216,7 +216,24 @@ def fit_timeout():
         signal.signal(signal.SIGALRM, previous)
 
 
+WINDOW_REQUIRED_ANCHORS = {
+    "ward_preop": [],
+    "preinduction_5_1": ["seconds_from_induction"],
+    "postinduction_all": ["seconds_from_induction"],
+    "induction_to_intubation": ["seconds_from_induction", "seconds_from_intubation"],
+    "intubation_to_surgery": ["seconds_from_intubation", "seconds_from_surgery_start"],
+}
+
+
 def window_mask(data: pd.DataFrame, key: str) -> pd.Series:
+    needed = WINDOW_REQUIRED_ANCHORS.get(key, ["seconds_from_surgery_start"])
+    unusable = [c for c in needed if c not in data.columns or data[c].isna().all()]
+    if unusable:
+        raise RuntimeError(
+            f"窗口 {key} 需要的时间锚点列缺失或全为空：{unusable}。"
+            "请改用包含这些列的时序文件，或跳过该窗口。"
+        )
+
     ind = data["seconds_from_induction"]
     intu = data["seconds_from_intubation"]
     surg = data["seconds_from_surgery_start"]
@@ -261,6 +278,25 @@ def time_in_window(data: pd.DataFrame, key: str) -> pd.Series:
     return (data["seconds_from_surgery_start"] - offset) / 60.0
 
 
+def _report_redcap_match(points: pd.DataFrame, how: str) -> None:
+    """报告有多少患者拿到了 REDCap 术前时间，并列出没拿到的人。
+
+    没有术前起止时间的患者会在 ward_preop 窗口整体消失，所以必须点名。
+    """
+    has_times = points.groupby("subject_id")["preop_start"].apply(
+        lambda column: bool(column.notna().any())
+    )
+    matched = sorted(has_times[has_times].index)
+    unmatched = sorted(has_times[~has_times].index)
+
+    log(f"  REDCap 术前时间按{how}匹配成功：{len(matched)} 名患者")
+    if unmatched:
+        log(f"  时序数据里有、但 REDCap 无术前起止时间：{len(unmatched)} 名患者"
+            "（ward_preop 窗口会缺席）")
+        for subject_id in unmatched:
+            log(f"      [无REDCap术前时间] {subject_id}")
+
+
 def load_timepoint_data(timeseries_path: Path, covariate_path: Path, redcap_path: Path) -> pd.DataFrame:
     """保留每个HemoSphere 20秒时间点；分钟级药物协变量向下匹配。"""
     wanted = {
@@ -270,6 +306,17 @@ def load_timepoint_data(timeseries_path: Path, covariate_path: Path, redcap_path
         "seconds_from_surgery_start",
     }
     raw = pd.read_csv(timeseries_path, usecols=lambda c: c in wanted, low_memory=False)
+
+    # usecols 是"有就读"，缺列不会报错，于是后面才在 window_mask 里
+    # 抛 KeyError。这里先补齐列名，缺的列填 NaN 并明确提示。
+    absent = sorted(wanted - set(raw.columns))
+    if absent:
+        log("\n注意：时序文件缺少以下列，已按缺失值处理：")
+        for column in absent:
+            log(f"      {column}")
+            raw[column] = np.nan
+        log("      依赖这些列的时间窗将没有数据，会被明确报错而不是静默出错。")
+
     raw["timepoint"] = pd.to_datetime(raw["timestamp_local"], errors="coerce")
     raw["minute"] = raw["timepoint"].dt.floor("min")
     numeric = [c for c in raw.columns if c not in {"subject_id", "screening_id", "timestamp_local", "timepoint", "minute"}]
@@ -316,8 +363,14 @@ def load_timepoint_data(timeseries_path: Path, covariate_path: Path, redcap_path
             "REDCap 中找不到术前监测起止时间列；ward_preop 窗口无法构建。"
         )
 
-    redcap["preop_start"] = pd.to_datetime(redcap[start_col], errors="coerce")
-    redcap["preop_end"] = pd.to_datetime(redcap[end_col], errors="coerce")
+    # 只取需要的三列另建小表，避免往 740 列的宽表里反复插列。
+    redcap = pd.DataFrame({
+        "_start": pd.to_datetime(redcap[start_col], errors="coerce"),
+        "_end": pd.to_datetime(redcap[end_col], errors="coerce"),
+        **{column: redcap[column] for column in redcap.columns},
+    })
+    redcap["preop_start"] = redcap.pop("_start")
+    redcap["preop_end"] = redcap.pop("_end")
 
     # 研究 ID 形如 IUMH2026030501，pd.to_numeric 会把它整列变成 NaN，
     # 于是合并不上、preop 时间全空、ward_preop 窗口一个点都没有。
@@ -342,9 +395,7 @@ def load_timepoint_data(timeseries_path: Path, covariate_path: Path, redcap_path
             .drop_duplicates("subject_id", keep="first")
         )
         points = points.merge(lookup, on="subject_id", how="left")
-        matched = int(points["preop_start"].notna().groupby(
-            points["subject_id"]).any().sum())
-        log(f"  REDCap 术前时间按研究 ID 匹配成功：{matched} 名患者")
+        _report_redcap_match(points, "研究 ID")
     elif "screening_id" in points.columns and "Screening ID" in redcap.columns:
         redcap["screening_id"] = pd.to_numeric(redcap["Screening ID"],
                                                errors="coerce")
@@ -356,9 +407,7 @@ def load_timepoint_data(timeseries_path: Path, covariate_path: Path, redcap_path
             .drop_duplicates("screening_id")
         )
         points = points.merge(lookup, on="screening_id", how="left")
-        matched = int(points["preop_start"].notna().groupby(
-            points["subject_id"]).any().sum())
-        log(f"  REDCap 术前时间按 screening_id 匹配成功：{matched} 名患者")
+        _report_redcap_match(points, "screening_id")
     else:
         raise RuntimeError("REDCap 与时序数据之间找不到可用的 ID 列。")
 
