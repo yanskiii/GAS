@@ -56,10 +56,28 @@ Research IDs
   are therefore filled across each record block before anything else, otherwise
   an OR-entry time living on a sibling row is invisible.
 
+Measuring the lag
+-----------------
+  The pooled curve is descriptive only. Pooling every patient's samples and
+  smoothing once produces a curve whose onset is a blend of all the individual
+  onsets, so it is more gradual, and its half-way point later, than any single
+  patient's -- and it yields no number you can put an interval on.
+
+  So each patient is ALSO timed on their own trace: baseline from their own
+  preop window, response sized from the plateau around their own extreme, and
+  the times at which they cross 10 / 50 / 90 % of their own change. Those give
+  one number per patient, which is the unit a paired test can use. The two
+  signals are then compared WITHIN patient, with a 95% interval from resampling
+  patients and a Wilcoxon signed-rank test. That paired difference is the lag.
+
 Output
 ------
-  One PNG. Everything else -- per-patient windows, exclusions, ID repairs, the
-  lag readout and the summary statistics -- is printed to the terminal.
+  Two PNGs:
+    <signals>_vs_time_scatter.png                   absolute values
+    <signals>_vs_time_scatter_baseline_adjusted.png each patient as % change
+                                                    from their own preop baseline
+  Everything else -- per-patient windows, exclusions, ID repairs, baselines, the
+  lag readouts and the summary statistics -- is printed to the terminal.
 
 Usage
 -----
@@ -182,11 +200,25 @@ def parse_args() -> argparse.Namespace:
         default="PSi",
         help="Which Sedline signal fills the top panel (default PSi).")
     parser.add_argument(
-        "--min-minutes", type=float, default=-10.0,
-        help="Left edge, minutes before induction (default -10).")
+        "--min-minutes", type=float, default=-6.0,
+        help="Left edge, minutes before induction (default -6).")
     parser.add_argument(
         "--max-minutes", type=float, default=15.0,
         help="Right edge, minutes after induction (default 15).")
+    parser.add_argument(
+        "--baseline-minutes", type=float, default=5.0,
+        help="Length of each patient's own preop baseline window, ending at "
+             "induction (default 5, i.e. -5..0 min). Used for the "
+             "baseline-adjusted figure and the per-patient lag analysis.")
+    parser.add_argument(
+        "--min-baseline-samples", type=int, default=30,
+        help="Samples a patient needs inside the baseline window to be kept in "
+             "the baseline-adjusted figure (default 30, one minute at 2 s).")
+    parser.add_argument(
+        "--baseline-mode", choices=["percent", "delta"], default="percent",
+        help="How the second figure standardizes each patient: 'percent' "
+             "(default) plots %% change from that patient's own preop baseline, "
+             "'delta' plots the raw difference in the signal's own units.")
     parser.add_argument(
         "--max-artf", type=float, default=None,
         help="Optional: drop Sedline samples whose ARTF %% exceeds this. Off by "
@@ -218,6 +250,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-boot", type=int, default=100,
         help="Patient-level bootstrap replicates used for --band.")
+    parser.add_argument(
+        "--plateau-minutes", type=float, default=1.0,
+        help="Half-width of the plateau averaged around each patient's extreme "
+             "to size their response (default 1.0 min). Sizing from a single "
+             "extreme sample overstates the response and biases every crossing "
+             "time late.")
+    parser.add_argument(
+        "--smooth-samples", type=int, default=15,
+        help="Rolling-median width used on each patient's own trace in the "
+             "per-patient lag analysis (default 15 samples, ~30 s at 2 s). "
+             "Only denoises the individual trace; it does not touch the plots.")
     parser.add_argument(
         "--no-id-repair", action="store_true",
         help="Skip the automatic Date-of-Surgery ID check. The hardcoded "
@@ -730,6 +773,158 @@ def build_points(filepaths: Path, series: str, args: argparse.Namespace,
 
 
 # --------------------------------------------------------------------------- #
+# Per-patient baseline
+# --------------------------------------------------------------------------- #
+
+def baseline_window(args: argparse.Namespace) -> tuple[float, float]:
+    """The preop stretch each patient is normalized against, clamped to the plot."""
+    return max(args.min_minutes, -abs(args.baseline_minutes)), 0.0
+
+
+def add_baseline_adjustment(points: pd.DataFrame, args: argparse.Namespace):
+    """Express every sample relative to that patient's own preop baseline.
+
+    Patients start from very different absolute levels -- cerebral StO2 in
+    particular runs anywhere from the mid-50s to the high 70s -- so a pooled
+    scatter of absolute values mixes between-patient differences in where a
+    patient sits with the within-patient change induction actually caused. Only
+    the second is the effect under study. Subtracting each patient's own
+    baseline removes the first, which is also what makes the two panels
+    comparable to each other despite being in different units.
+
+    Percent change is the default because that is the convention for cerebral
+    oximetry, where thresholds are quoted relative to a patient's own baseline
+    rather than as absolute saturations.
+
+    Returns (points with an `adjusted` column, per-patient baseline table,
+    list of subject_ids dropped for too little baseline data).
+    """
+    low, high = baseline_window(args)
+    in_window = points["minutes"].between(low, high)
+
+    stats = (points.loc[in_window].groupby("subject_id")["value"]
+             .agg(baseline="median", baseline_sd="std", baseline_n="size")
+             .reset_index())
+    usable = stats.loc[stats["baseline_n"] >= args.min_baseline_samples]
+    dropped = sorted(set(points["subject_id"]) - set(usable["subject_id"]))
+
+    merged = points.merge(usable, on="subject_id", how="inner")
+    if args.baseline_mode == "percent":
+        # A zero baseline would divide by zero; neither PSi nor StO2 can be 0
+        # for a whole baseline window, so guard rather than special-case.
+        merged = merged.loc[merged["baseline"].abs() > 1e-9]
+        merged["adjusted"] = (100.0 * (merged["value"] - merged["baseline"])
+                              / merged["baseline"])
+    else:
+        merged["adjusted"] = merged["value"] - merged["baseline"]
+    return merged, usable, dropped
+
+
+def per_patient_response(points: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    """Each patient's own response timing, fitted to that patient alone.
+
+    This is the estimate the pooled curve cannot give. Pooling every patient's
+    samples and smoothing once produces a curve whose onset is a blend of all
+    the individual onsets, so it is systematically more gradual -- and its
+    half-way point later -- than any single patient's. Timing each patient
+    separately and then comparing gives one number per patient, which is the
+    unit a paired test can actually use.
+
+    A patient is only timed if their post-induction excursion clears three times
+    their own baseline noise, so a flat trace does not contribute a meaningless
+    crossing time.
+    """
+    low, _high = baseline_window(args)
+    rows = []
+    for subject_id, group in points.groupby("subject_id", sort=True):
+        group = group.sort_values("minutes")
+        # Smooth the whole trace once, then split. The response is read off the
+        # smoothed trace, so the noise it must clear has to be the noise of the
+        # SMOOTHED baseline too; comparing a smoothed excursion against raw
+        # sample-to-sample scatter sets the bar far too high and rejects
+        # patients who plainly responded.
+        smoothed_all = group["value"].rolling(
+            args.smooth_samples, center=True, min_periods=1).median()
+
+        in_baseline = group["minutes"].between(low, 0.0)
+        if int(in_baseline.sum()) < args.min_baseline_samples:
+            continue
+        baseline = float(group.loc[in_baseline, "value"].median())
+        pre_smooth = smoothed_all.loc[in_baseline]
+        noise = float(pre_smooth.std(ddof=1)) if len(pre_smooth) > 1 else 0.0
+
+        after = group["minutes"] >= 0.0
+        if int(after.sum()) < 10:
+            continue
+        smooth = smoothed_all.loc[after].to_numpy()
+        times = group.loc[after, "minutes"].to_numpy(float)
+
+        extreme_index = int(np.argmax(np.abs(smooth - baseline)))
+        # Size the response from the PLATEAU around the extreme, not from the
+        # single most extreme sample. One sample is the largest of several
+        # hundred noisy ones, so it overstates the response, which pushes the
+        # crossing targets outward and every crossing time late. On simulated
+        # traces with a known 2.68 min lag, the single-point version returned
+        # 2.98 and this one returns 2.70.
+        near = np.abs(times - times[extreme_index]) <= args.plateau_minutes
+        change = float(np.median(smooth[near]) - baseline)
+        if abs(change) < max(3.0 * noise, 1e-9):
+            continue
+
+        row = {"subject_id": subject_id, "baseline": round(baseline, 2),
+               "change": round(change, 2),
+               "t_extreme": round(float(times[extreme_index]), 2)}
+        rising = change > 0
+        for name, fraction in (("t10", 0.10), ("t50", 0.50), ("t90", 0.90)):
+            target = baseline + fraction * change
+            hit = np.flatnonzero(smooth >= target if rising else smooth <= target)
+            row[name] = round(float(times[hit[0]]), 3) if hit.size else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def paired_lag(first: pd.DataFrame, second: pd.DataFrame, names: tuple[str, str],
+               args: argparse.Namespace) -> list[str]:
+    """Within-patient difference in response timing between two signals.
+
+    Paired on the patient, so each patient acts as their own control and the
+    between-patient spread in absolute timing drops out. The interval comes from
+    resampling patients, which is the independent unit here.
+    """
+    merged = first.merge(second, on="subject_id", suffixes=("_a", "_b"))
+    lines = [f"Patients timed in both signals: {len(merged)}"]
+    if len(merged) < 5:
+        lines.append("Too few paired patients for a lag comparison.")
+        return lines
+
+    rng = np.random.default_rng(args.seed)
+    for name, label in (("t10", "10%"), ("t50", "50%"), ("t90", "90%")):
+        pair = merged[[f"{name}_a", f"{name}_b"]].dropna()
+        if len(pair) < 5:
+            lines.append(f"  {label}: too few patients with both times")
+            continue
+        difference = (pair[f"{name}_b"] - pair[f"{name}_a"]).to_numpy(float)
+        draws = rng.choice(difference, size=(2000, len(difference)), replace=True)
+        low, high = np.percentile(np.median(draws, axis=1), [2.5, 97.5])
+        lines.append(
+            f"  time to {label} of own change — "
+            f"{names[0]} median {pair[f'{name}_a'].median():.2f} min, "
+            f"{names[1]} median {pair[f'{name}_b'].median():.2f} min, "
+            f"paired difference {np.median(difference):+.2f} min "
+            f"(95% CI {low:+.2f} to {high:+.2f}, n={len(pair)})"
+        )
+        try:
+            from scipy.stats import wilcoxon
+            lines[-1] += f", Wilcoxon p={wilcoxon(difference).pvalue:.3g}"
+        except Exception:
+            pass
+
+    lines.append(f"A positive difference means {names[1]} responds LATER than "
+                 f"{names[0]} in the same patient.")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
 # Trend curve, fitted separately either side of induction
 # --------------------------------------------------------------------------- #
 
@@ -819,14 +1014,14 @@ def patient_coverage(points: pd.DataFrame, grid: np.ndarray,
 
 
 def bootstrap_band(points: pd.DataFrame, grid: np.ndarray,
-                   args: argparse.Namespace):
+                   args: argparse.Namespace, value_column: str = "value"):
     """95% band from resampling PATIENTS, not rows.
 
     A patient contributes thousands of correlated samples, so a row bootstrap
     would produce an interval far narrower than the data supports.
     """
     minutes = points["minutes"].to_numpy(float)
-    values = points["value"].to_numpy(float)
+    values = points[value_column].to_numpy(float)
     rng = np.random.default_rng(args.seed)
     subject_ids = points["subject_id"].to_numpy()
     unique_ids = np.unique(subject_ids)
@@ -911,24 +1106,35 @@ def lag_readout(grid: np.ndarray, fitted: np.ndarray,
 # Figure
 # --------------------------------------------------------------------------- #
 
-def draw_panel(axis, panel: dict, args: argparse.Namespace) -> None:
+def axis_label(series: str, value_column: str, args: argparse.Namespace) -> str:
+    spec = SERIES[series]
+    if value_column == "value":
+        return spec["label"]
+    if args.baseline_mode == "percent":
+        return f"{spec['label']}\n% change from own preop baseline"
+    return f"{spec['label']}\nchange from own preop baseline"
+
+
+def draw_panel(axis, panel: dict, args: argparse.Namespace,
+               value_column: str) -> None:
     spec = SERIES[panel["series"]]
-    points = panel["points"]
+    points = panel["points" if value_column == "value" else "adjusted_points"]
     n_points = len(points)
 
     axis.scatter(
-        points["minutes"], points["value"],
+        points["minutes"], points[value_column],
         s=4, alpha=0.08 if n_points > 50_000 else 0.18,
         color=spec["color"], edgecolors="none", rasterized=True, zorder=2,
         label=f"raw samples (n={n_points:,}, "
               f"{points['subject_id'].nunique()} patients)",
     )
 
-    fitted = panel.get("fitted")
+    fit = panel.get("fits", {}).get(value_column, {})
+    fitted = fit.get("fitted")
     if fitted is not None:
-        if panel.get("band_low") is not None:
+        if fit.get("band_low") is not None:
             axis.fill_between(
-                panel["grid"], panel["band_low"], panel["band_high"],
+                panel["grid"], fit["band_low"], fit["band_high"],
                 color="#d1495b", alpha=0.20, zorder=4,
                 label="95% band: refit after resampling patients",
             )
@@ -942,7 +1148,12 @@ def draw_panel(axis, panel: dict, args: argparse.Namespace) -> None:
                         f"separately each side of induction")
 
     axis.axvline(0, color="black", ls="--", lw=1.5, zorder=3)
-    axis.set_ylabel(spec["label"])
+    if value_column == "adjusted":
+        low, _high = baseline_window(args)
+        axis.axhline(0, color="#555555", lw=1.2, zorder=3)
+        axis.axvspan(low, 0.0, color="#999999", alpha=0.10, zorder=1,
+                     label=f"baseline window ({low:g} to 0 min)")
+    axis.set_ylabel(axis_label(panel["series"], value_column, args))
     axis.grid(True, color="#d9d9d9", lw=0.6, alpha=0.8)
     axis.set_axisbelow(True)
     legend = axis.legend(loc="lower left", framealpha=0.95, fontsize=8.5,
@@ -955,7 +1166,7 @@ def draw_panel(axis, panel: dict, args: argparse.Namespace) -> None:
 
 
 def make_figure(panels: list[dict], args: argparse.Namespace,
-                output_path: Path) -> None:
+                output_path: Path, value_column: str = "value") -> None:
     figure, axes = plt.subplots(
         len(panels), 1, sharex=True, squeeze=False,
         figsize=(13, 5.0 * len(panels)),
@@ -963,7 +1174,7 @@ def make_figure(panels: list[dict], args: argparse.Namespace,
     axes = axes.ravel()
 
     for axis, panel in zip(axes, panels):
-        draw_panel(axis, panel, args)
+        draw_panel(axis, panel, args, value_column)
 
     axes[0].annotate(
         "INDUCTION", xy=(0, 1.0), xycoords=("data", "axes fraction"),
@@ -975,12 +1186,17 @@ def make_figure(panels: list[dict], args: argparse.Namespace,
                         "0 = primary induction med pushed")
 
     names = " and ".join(SERIES[panel["series"]]["label"] for panel in panels)
-    figure.suptitle(
-        f"{names} versus time from induction\n"
-        f"every valid raw sample plotted, nothing averaged — "
-        f"panels share the induction anchor, so changes line up vertically",
-        fontsize=13,
-    )
+    if value_column == "value":
+        subtitle = ("every valid raw sample plotted, nothing averaged — "
+                    "panels share the induction anchor, so changes line up "
+                    "vertically")
+    else:
+        low, _high = baseline_window(args)
+        unit = "% change" if args.baseline_mode == "percent" else "change"
+        subtitle = (f"each patient expressed as {unit} from their OWN preop "
+                    f"baseline (median of {low:g} to 0 min) — removes "
+                    f"between-patient differences in starting level")
+    figure.suptitle(f"{names} versus time from induction\n{subtitle}", fontsize=13)
     figure.tight_layout(rect=(0, 0, 1, 0.97))
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(figure)
@@ -1124,37 +1340,82 @@ def main() -> int:
     for panel in panels:
         report_panel(panel, args)
 
+    # ---- per-patient baseline, used by the second figure and the lag test ----
+    low_edge, _high = baseline_window(args)
+    banner(f"Per-patient preop baseline ({low_edge:g} to 0 min, "
+           f"{args.baseline_mode})")
     for panel in panels:
-        points = panel["points"]
+        adjusted, baselines, dropped = add_baseline_adjustment(panel["points"], args)
+        panel["adjusted_points"] = adjusted
+        panel["baselines"] = baselines
+        print(f"  {panel['series']}: baseline available for {len(baselines)} of "
+              f"{panel['points']['subject_id'].nunique()} patients "
+              f"(median {baselines['baseline'].median():.1f}, range "
+              f"{baselines['baseline'].min():.1f}-{baselines['baseline'].max():.1f})")
+        if dropped:
+            print(f"      {len(dropped)} patient(s) have fewer than "
+                  f"{args.min_baseline_samples} baseline samples and are absent "
+                  f"from the baseline-adjusted figure: {', '.join(dropped)}")
+
+    # ---- pooled trend curves, for both the raw and the adjusted figure ----
+    for panel in panels:
+        panel["fits"] = {}
         if args.fit == "none":
             continue
-        fitted = fit_curve(points["minutes"].to_numpy(float),
-                           points["value"].to_numpy(float), grid, args)
-        if fitted is None:
-            continue
-        coverage = patient_coverage(points, grid)
-        thin = coverage < args.min_patients
-        fitted = np.where(thin, np.nan, fitted)
-        panel["fitted"] = fitted
-        panel["coverage"] = coverage
-        if thin.any():
-            edges = grid[~thin]
-            print(f"\n{panel['series']}: trend curve drawn only from "
-                  f"{edges.min():.1f} to {edges.max():.1f} min, where at least "
-                  f"{args.min_patients} patients have data.")
-        if args.band and args.n_boot > 0:
-            print(f"{panel['series']}: resampling patients for the 95% band "
-                  f"({args.n_boot} replicates)...")
-            low, high = bootstrap_band(points, grid, args)
-            if low is not None:
-                panel["band_low"] = np.where(thin, np.nan, low)
-                panel["band_high"] = np.where(thin, np.nan, high)
+        for value_column, frame in (("value", panel["points"]),
+                                    ("adjusted", panel["adjusted_points"])):
+            if frame.empty:
+                continue
+            fitted = fit_curve(frame["minutes"].to_numpy(float),
+                               frame[value_column].to_numpy(float), grid, args)
+            if fitted is None:
+                continue
+            thin = patient_coverage(frame, grid) < args.min_patients
+            entry = {"fitted": np.where(thin, np.nan, fitted)}
+            if thin.any() and value_column == "value":
+                edges = grid[~thin]
+                print(f"\n{panel['series']}: trend curve drawn only from "
+                      f"{edges.min():.1f} to {edges.max():.1f} min, where at "
+                      f"least {args.min_patients} patients have data.")
+            if args.band and args.n_boot > 0:
+                print(f"{panel['series']} [{value_column}]: resampling patients "
+                      f"for the 95% band ({args.n_boot} replicates)...")
+                band_low, band_high = bootstrap_band(frame, grid, args,
+                                                     value_column)
+                if band_low is not None:
+                    entry["band_low"] = np.where(thin, np.nan, band_low)
+                    entry["band_high"] = np.where(thin, np.nan, band_high)
+            panel["fits"][value_column] = entry
 
     for panel in panels:
-        if panel.get("fitted") is None:
+        fitted = panel["fits"].get("value", {}).get("fitted")
+        if fitted is None:
             continue
-        banner(f"{panel['series']}: lag readout after the drug is pushed")
-        for line in lag_readout(grid, panel["fitted"], panel["points"]):
+        banner(f"{panel['series']}: pooled lag readout after the drug is pushed")
+        for line in lag_readout(grid, fitted, panel["points"]):
+            print(f"  {line}")
+
+    # ---- per-patient timing, and the paired comparison between signals ----
+    banner("Per-patient response timing (each patient timed on their own trace)")
+    for panel in panels:
+        panel["timing"] = per_patient_response(panel["points"], args)
+        timing = panel["timing"]
+        if timing.empty:
+            print(f"  {panel['series']}: no patient cleared the noise threshold.")
+            continue
+        print(f"  {panel['series']}: {len(timing)} of "
+              f"{panel['points']['subject_id'].nunique()} patients timed; "
+              f"median change {timing['change'].median():+.1f}, "
+              f"median time to 50% {timing['t50'].median():.2f} min "
+              f"(IQR {timing['t50'].quantile(0.25):.2f}-"
+              f"{timing['t50'].quantile(0.75):.2f})")
+
+    timed = [panel for panel in panels if not panel["timing"].empty]
+    if len(timed) == 2:
+        banner(f"Lag test: does {timed[1]['series']} respond later than "
+               f"{timed[0]['series']} in the same patient?")
+        for line in paired_lag(timed[0]["timing"], timed[1]["timing"],
+                               (timed[0]["series"], timed[1]["series"]), args):
             print(f"  {line}")
 
     rows = []
@@ -1172,9 +1433,13 @@ def main() -> int:
     print(pd.DataFrame(rows).to_string(index=False))
 
     stem = "_".join(panel["series"].lower() for panel in panels)
-    figure_path = args.outdir / f"{stem}_vs_time_scatter.png"
-    make_figure(panels, args, figure_path)
-    print(f"\nFigure: {figure_path}")
+    raw_path = args.outdir / f"{stem}_vs_time_scatter.png"
+    adjusted_path = args.outdir / f"{stem}_vs_time_scatter_baseline_adjusted.png"
+    make_figure(panels, args, raw_path, "value")
+    print(f"\nFigure (absolute values):   {raw_path}")
+    if all(not panel["adjusted_points"].empty for panel in panels):
+        make_figure(panels, args, adjusted_path, "adjusted")
+        print(f"Figure (baseline-adjusted): {adjusted_path}")
     return 0
 
 
