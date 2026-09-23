@@ -164,6 +164,11 @@ def parse_args() -> argparse.Namespace:
         "--min-samples", type=int, default=10,
         help="Post-induction samples a patient needs to be timed (default 10).")
     parser.add_argument(
+        "--exclude", nargs="*", default=[], metavar="ID",
+        help="Research IDs to drop from the figure entirely, e.g. "
+             "--exclude IUMH2026011501. Every exclusion is named in the "
+             "report, so the figure never hides who is missing.")
+    parser.add_argument(
         "--no-id-repair", action="store_true",
         help="Skip the automatic Date-of-Surgery ID check. The hardcoded "
              "REDCAP_ID_FIXES table still applies.")
@@ -793,11 +798,42 @@ def main() -> int:
     merged = tables["PSi"].merge(tables["StO2"], on="subject_id",
                                  suffixes=("_psi", "_sto2"))
 
+    # ---- who is furthest out, so an exclusion can be chosen by name ---------
+    banner("Most extreme event times (candidates for --exclude)")
+    print("  A record running many hours past induction is no longer an "
+          "induction response, and a single such patient can stretch panels B "
+          "and C so the rest collapse into the corner.\n")
+    for label, column in (("PSi lowest", "t_extreme_psi"),
+                          ("StO2 highest", "t_extreme_sto2"),
+                          ("PSi halfway", "t50_psi"),
+                          ("StO2 halfway", "t50_sto2")):
+        ranked = merged[["subject_id", column]].dropna().nlargest(5, column)
+        entries = ", ".join(f"{row.subject_id} ({getattr(row, column):.0f} min)"
+                            for row in ranked.itertuples())
+        print(f"  latest {label:<14} {entries}")
+
+    if args.exclude:
+        wanted = {str(value).strip().upper() for value in args.exclude}
+        present = wanted & set(merged["subject_id"])
+        missing = wanted - present
+        merged = merged.loc[~merged["subject_id"].isin(present)]
+        banner(f"Excluded by --exclude ({len(present)} patient(s))")
+        for subject_id in sorted(present):
+            print(f"  {subject_id}")
+        if missing:
+            print(f"  NOT FOUND (check the spelling): {', '.join(sorted(missing))}")
+        if merged.empty:
+            sys.stderr.write("\nEvery patient was excluded.\n")
+            return 1
+
     banner("Patients in the figure")
     psi_ids, sto2_ids = set(tables["PSi"]["subject_id"]), set(tables["StO2"]["subject_id"])
-    print(f"  PSi measured        {len(psi_ids)}")
-    print(f"  StO2 measured       {len(sto2_ids)}")
-    print(f"  in BOTH (plotted)   {len(merged)}")
+    print(f"  PSi measured           {len(psi_ids)}")
+    print(f"  StO2 measured          {len(sto2_ids)}")
+    print(f"  in BOTH                {len(psi_ids & sto2_ids)}")
+    if args.exclude:
+        print(f"  after --exclude        {len(merged)}")
+    print(f"  PLOTTED                {len(merged)}")
     print("\nA patient needs BOTH signals to be a dot, so the figure can never "
           "exceed the smaller of the two lists above.")
     for series, ids, other in (("PSi", psi_ids, sto2_ids),
