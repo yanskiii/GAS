@@ -62,21 +62,55 @@ The lag itself
   earlier half-way crossing alongside a later peak is one coherent story, not a
   contradiction. The run says so explicitly when it happens.
 
+Cross-correlation: the same lag, measured without choosing an event
+------------------------------------------------------------------
+  The panels above all depend on picking an event to time, and panels B and C
+  show that the answer can depend on which one. The second figure avoids the
+  choice entirely: each patient's two traces are resampled onto a shared grid
+  and slid against each other, and the shift that best aligns them is that
+  patient's lag. One number per patient, then a histogram.
+
+  PSi falls while StO2 rises, so the two are anti-correlated and the best
+  alignment is the most NEGATIVE correlation. Sign convention matches the rest
+  of the script: positive lag means StO2 follows PSi.
+
+  If this agrees in direction with the half-way crossing, the lag has survived a
+  method that never picks an event at all, which is a genuinely independent
+  check rather than a restatement. The run says whether they agree.
+
+Three-signal timing map
+-----------------------
+  With beat-to-beat MAP added, the third figure places all three signals on one
+  timing axis within each patient: a ladder of every patient's three event
+  times, and a forest of the three pairwise differences with intervals. This is
+  what connects the lag work to the project's actual question, since hypotension
+  is the outcome and MAP is where it shows up.
+
+  MAP is optional. If no MAP file list is found the other two figures are
+  produced exactly as before.
+
 Data sources
 ------------
   * Sedline files, one path per line in --filepaths
   * StO2 files, one path per line in --sto2-filepaths
+  * Beat-to-beat MAP files in --map-filepaths (optional; databad == 1 rows are
+    dropped, and clock-only timestamps are re-dated onto the surgery day)
   * REDCap labeled export (--redcap) for induction time, OR entry and
     Date of Surgery
 
 Output
 ------
-  One PNG, plus a full per-patient inclusion report on the terminal naming every
-  patient that did not make the figure and exactly why. No CSVs.
+  Three PNGs:
+    psi_sto2_lag_scatter.png       the paired per-patient scatters
+    psi_sto2_crosscorrelation.png  the waveform-based lag, as a histogram
+    psi_sto2_map_timing_map.png    all three signals on one timing axis
+  Plus a full per-patient inclusion report on the terminal naming every patient
+  that did not make a figure and exactly why. No CSVs.
 
 Usage
 -----
     python lag_scatter.py
+    python lag_scatter.py --map-filepaths /path/to/btb_filepaths.csv
     python lag_scatter.py --search-minutes 30
     python lag_scatter.py --smooth-samples 1     # no smoothing at all
 """
@@ -127,7 +161,22 @@ SERIES = {
         "extreme_word": "highest", "event": "StO2 was at its highest",
         "half_word": "to rise halfway",
     },
+    "MAP": {
+        "kind": "map", "column_prefix": "meanarterial", "direction": "min",
+        "label": "Mean arterial pressure (mmHg)", "valid_range": (20.0, 160.0),
+        "extreme_word": "lowest", "event": "MAP was at its lowest",
+        "half_word": "to fall halfway",
+    },
 }
+
+# Colour per signal, used by the three-signal timing figure.
+SIGNAL_COLORS = {"PSi": "#4c78a8", "StO2": "#2f7d4f", "MAP": "#b5651d"}
+
+# Filenames tried for the beat-to-beat MAP list when --map-filepaths is left
+# at its default, since this list has been called several things.
+MAP_LIST_FALLBACKS = ("map_filepaths.csv", "btb_filepaths.csv",
+                      "b2b_filepaths.csv", "b2b_filepath.csv",
+                      "btb_filepath.csv")
 
 STO2_CHANNELS = (1, 2, 3, 4)
 ID_PATTERN = re.compile(r"IU(?:MH|UH)\d+", re.IGNORECASE)
@@ -151,6 +200,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sto2-filepaths", type=Path, default=data / "sto2_filepaths.csv",
         help="CSV listing one cerebral-StO2 file path per line.")
+    parser.add_argument(
+        "--map-filepaths", type=Path, default=None,
+        help="CSV listing one beat-to-beat MAP file path per line. Left "
+             "unset, several usual names are tried inside the data folder; if "
+             "none is found the two MAP figures are skipped and the rest of "
+             "the run is unaffected.")
     parser.add_argument(
         "--redcap", type=Path,
         default=data / ("PR_6.16.26.FIXED-TYPOS-BDPostInductionHemod_"
@@ -186,6 +241,20 @@ def parse_args() -> argparse.Namespace:
         help="Research IDs to drop from the figure entirely, e.g. "
              "--exclude IUMH2026011501. Every exclusion is named in the "
              "report, so the figure never hides who is missing.")
+    parser.add_argument(
+        "--max-lag", type=float, default=5.0,
+        help="Widest lead or lag tested by the cross-correlation, in minutes "
+             "(default 5). The search runs from -max-lag to +max-lag.")
+    parser.add_argument(
+        "--ccf-step-seconds", type=float, default=10.0,
+        help="Grid spacing both traces are resampled onto before "
+             "cross-correlating (default 10 s). Also the resolution of the "
+             "lag estimate.")
+    parser.add_argument(
+        "--ccf-lead-minutes", type=float, default=3.0,
+        help="Minutes of pre-induction record included in the "
+             "cross-correlation (default 3). Some baseline anchors the "
+             "'before' state; too much dilutes the response with flat signal.")
     parser.add_argument(
         "--no-id-repair", action="store_true",
         help="Skip the automatic Date-of-Surgery ID check. The hardcoded "
@@ -441,7 +510,8 @@ def load_event_times(redcap_path: Path,
     return events, notes
 
 
-def load_sedline_file(path: str, series: str) -> pd.DataFrame | None:
+def load_sedline_file(path: str, series: str,
+                      induction: pd.Timestamp | None = None) -> pd.DataFrame | None:
     """Timestamped, valid samples of one Sedline signal from one patient."""
     frame = pd.read_csv(path, low_memory=False)
     value_column = find_column(frame, SERIES[series]["column_prefix"])
@@ -469,7 +539,8 @@ def load_sedline_file(path: str, series: str) -> pd.DataFrame | None:
                          "value": pd.to_numeric(frame[value_column], errors="coerce")})
 
 
-def load_sto2_file(path: str, series: str) -> pd.DataFrame | None:
+def load_sto2_file(path: str, series: str,
+                   induction: pd.Timestamp | None = None) -> pd.DataFrame | None:
     """Cerebral StO2 averaged over the channels flagged valid on each row."""
     frame = pd.read_csv(path, low_memory=False)
     time_column = find_column(frame, "time")
@@ -499,15 +570,87 @@ def load_sto2_file(path: str, series: str) -> pd.DataFrame | None:
                          "value": (total / count).where(count > 0)})
 
 
-LOADERS = {"sedline": load_sedline_file, "sto2": load_sto2_file}
+def anchor_clock_only(timestamp: pd.Series, induction: pd.Timestamp) -> pd.Series:
+    """Re-date bare clock times onto the surgery day, and unwrap midnight.
+
+    The beat-to-beat exports often carry a time of day with no date, which
+    pandas dates to today. Re-anchoring to the induction date fixes that, and a
+    record that runs past midnight then shows a ~24 h backward jump, which is
+    undone by adding a day to everything after each wrap.
+    """
+    if timestamp.isna().all() or pd.isna(induction):
+        return timestamp
+    today = pd.Timestamp.today().normalize()
+    on_today = timestamp.dt.normalize().eq(today)
+    if on_today.mean() > 0.9:
+        timestamp = induction.normalize() + (timestamp - today)
+    wrapped = timestamp.diff() < pd.Timedelta(hours=-12)
+    if wrapped.any():
+        timestamp = timestamp + pd.to_timedelta(wrapped.cumsum(), unit="D")
+    return timestamp
+
+
+def load_map_file(path: str, series: str,
+                  induction: pd.Timestamp | None = None) -> pd.DataFrame | None:
+    """Beat-to-beat MAP, with the monitor's own bad-data rows dropped."""
+    frame = pd.read_csv(path, low_memory=False, skipinitialspace=True)
+    frame.columns = [str(column).strip() for column in frame.columns]
+
+    value_column = (find_column(frame, SERIES[series]["column_prefix"])
+                    or find_column(frame, "map"))
+    time_column = find_column(frame, "time")
+    if value_column is None or time_column is None:
+        return None
+
+    # databad == 1 marks a beat the monitor itself flagged as unreliable.
+    bad_column = find_column(frame, "databad")
+    keep = pd.Series(True, index=frame.index)
+    if bad_column is not None:
+        keep &= pd.to_numeric(frame[bad_column], errors="coerce").ne(1)
+
+    timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
+                               errors="coerce", format="mixed")
+    timestamp = anchor_clock_only(timestamp, induction)
+    return pd.DataFrame({
+        "timestamp": timestamp,
+        "value": pd.to_numeric(frame[value_column], errors="coerce"),
+    }).loc[keep]
+
+
+LOADERS = {"sedline": load_sedline_file, "sto2": load_sto2_file,
+           "map": load_map_file}
+
+
+def resolve_map_list(explicit: Path | None, data_dir: Path) -> Path | None:
+    """The MAP file list, if one can be found. None means skip MAP quietly."""
+    if explicit is not None:
+        return explicit if explicit.is_file() else None
+    for name in MAP_LIST_FALLBACKS:
+        candidate = data_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 # --------------------------------------------------------------------------- #
 # One row per patient
 # --------------------------------------------------------------------------- #
 
+def ccf_grid(args: argparse.Namespace) -> np.ndarray:
+    """Shared time axis every patient's trace is resampled onto.
+
+    One grid for everybody is what makes the per-patient curves stackable and
+    the lag axis mean the same thing for each patient.
+    """
+    step = float(args.ccf_step_seconds) / 60.0
+    high = float(args.search_minutes) if args.search_minutes else 60.0
+    return np.arange(-abs(args.ccf_lead_minutes), high + step / 2.0, step)
+
+
 def measure_patients(filepaths: Path, series: str, args: argparse.Namespace,
-                     events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+                     events: pd.DataFrame,
+                     grid: np.ndarray | None = None
+                     ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """For each patient: their extreme value, when it happened, and their T50.
 
     No response-magnitude test is applied. The question asked is simply "what
@@ -523,6 +666,7 @@ def measure_patients(filepaths: Path, series: str, args: argparse.Namespace,
 
     rows: list[dict] = []
     audit: list[dict] = []
+    traces: dict[str, np.ndarray] = {}
 
     for path in read_filepath_list(filepaths):
         subject_id = patient_id_from_path(path)
@@ -545,7 +689,7 @@ def measure_patients(filepaths: Path, series: str, args: argparse.Namespace,
             audit.append(record); continue
 
         try:
-            frame = loader(path, series)
+            frame = loader(path, series, induction)
         except Exception as exc:
             record["status"] = f"read error: {exc}"
             audit.append(record); continue
@@ -621,6 +765,14 @@ def measure_patients(filepaths: Path, series: str, args: argparse.Namespace,
         record["min_before_record_end"] = round(
             float(post_times[-1] - post_times[index]), 2)
 
+        if grid is not None:
+            # Resample onto the shared grid for the cross-correlation. Points
+            # outside the record become NaN rather than being extrapolated, so
+            # a short record contributes only where it actually has data.
+            traces[subject_id] = np.interp(
+                grid, frame["minutes"].to_numpy(float), smoothed.to_numpy(float),
+                left=np.nan, right=np.nan)
+
         record["status"] = "included"
         rows.append({k: record.get(k) for k in
                      ("subject_id", "baseline", "extreme_value", "t_extreme",
@@ -628,7 +780,7 @@ def measure_patients(filepaths: Path, series: str, args: argparse.Namespace,
                       "min_before_record_end")})
         audit.append(record)
 
-    return pd.DataFrame(rows), pd.DataFrame(audit)
+    return pd.DataFrame(rows), pd.DataFrame(audit), traces
 
 
 # --------------------------------------------------------------------------- #
@@ -848,6 +1000,230 @@ def make_figure(merged: pd.DataFrame, args: argparse.Namespace,
 
 
 # --------------------------------------------------------------------------- #
+# Cross-correlation: the lag measured from the whole waveform
+# --------------------------------------------------------------------------- #
+
+def cross_correlation(x: np.ndarray, y: np.ndarray, max_lag_steps: int,
+                      min_overlap: int = 20) -> np.ndarray:
+    """corr(x(t), y(t + lag)) across lags, in grid steps.
+
+    The sign convention matters and matches the rest of this script: a POSITIVE
+    lag is y shifted later, so a peak at positive lag means y's response comes
+    after x's.
+    """
+    out = np.full(2 * max_lag_steps + 1, np.nan)
+    for position, lag in enumerate(range(-max_lag_steps, max_lag_steps + 1)):
+        if lag >= 0:
+            left, right = x[:len(x) - lag], y[lag:]
+        else:
+            left, right = x[-lag:], y[:len(y) + lag]
+        usable = np.isfinite(left) & np.isfinite(right)
+        if int(usable.sum()) < min_overlap:
+            continue
+        a, b = left[usable], right[usable]
+        if np.std(a) < 1e-9 or np.std(b) < 1e-9:
+            continue
+        out[position] = float(np.corrcoef(a, b)[0, 1])
+    return out
+
+
+def cross_correlation_lags(traces_x: dict, traces_y: dict, grid: np.ndarray,
+                           args: argparse.Namespace) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """Per-patient best lag between two signals, plus every patient's curve.
+
+    This is the lag measured from the SHAPE of the two traces rather than from
+    one chosen event, which is what makes it a genuinely independent check on
+    the event-timing panels. PSi falls while StO2 rises, so the two are
+    anti-correlated and the alignment we want is the most NEGATIVE correlation.
+    """
+    step = float(args.ccf_step_seconds) / 60.0
+    max_lag_steps = max(int(round(abs(args.max_lag) / step)), 1)
+    lags = np.arange(-max_lag_steps, max_lag_steps + 1) * step
+
+    rows, curves = [], []
+    for subject_id in sorted(set(traces_x) & set(traces_y)):
+        curve = cross_correlation(traces_x[subject_id], traces_y[subject_id],
+                                  max_lag_steps)
+        if np.isnan(curve).all():
+            continue
+        best = int(np.nanargmin(curve))
+        rows.append({"subject_id": subject_id,
+                     "lag": float(lags[best]),
+                     "r": float(curve[best])})
+        curves.append(curve)
+    return pd.DataFrame(rows), lags, (np.vstack(curves) if curves
+                                      else np.empty((0, len(lags))))
+
+
+def make_ccf_figure(table: pd.DataFrame, lags: np.ndarray, curves: np.ndarray,
+                    args: argparse.Namespace, output_path: Path) -> dict:
+    figure, axes = plt.subplots(1, 2, figsize=(14, 6.6))
+    summary: dict = {"n": len(table)}
+    if table.empty:
+        plt.close(figure)
+        return summary
+
+    values = table["lag"].to_numpy(float)
+    rng = np.random.default_rng(args.seed)
+    draws = rng.choice(values, size=(2000, len(values)), replace=True)
+    low, high = np.percentile(np.median(draws, axis=1), [2.5, 97.5])
+    summary.update({"median": float(np.median(values)),
+                    "ci": (float(low), float(high)),
+                    "strong": int((table["r"].abs() >= 0.5).sum()),
+                    "moderate": int((table["r"].abs() >= 0.3).sum())})
+    try:
+        from scipy.stats import wilcoxon
+        summary["p"] = float(wilcoxon(values).pvalue)
+    except Exception:
+        pass
+
+    step = float(args.ccf_step_seconds) / 60.0
+    axes[0].hist(values, bins=np.arange(lags.min() - step / 2,
+                                        lags.max() + step, max(step, 0.25)),
+                 color="#4c78a8", edgecolor="white")
+    axes[0].axvline(0, color="black", ls="--", lw=1.4)
+    axes[0].axvspan(low, high, color="#d1495b", alpha=0.18)
+    axes[0].axvline(summary["median"], color="#d1495b", lw=2.4)
+    axes[0].set_xlabel("Lag of StO2 behind PSi (minutes)\n"
+                       "negative = StO2 leads   |   positive = StO2 follows")
+    axes[0].set_ylabel("Number of patients")
+    axes[0].set_title("Per-patient best-fitting lag", fontsize=11)
+    axes[0].grid(True, axis="y", color="#e0e0e0", lw=0.6)
+    axes[0].set_axisbelow(True)
+
+    for curve in curves:
+        axes[1].plot(lags, curve, color="#4c78a8", alpha=0.12, lw=0.9)
+    with np.errstate(invalid="ignore"):
+        mean_curve = np.nanmean(curves, axis=0)
+    axes[1].plot(lags, mean_curve, color="#d1495b", lw=2.8)
+    axes[1].axvline(0, color="black", ls="--", lw=1.4)
+    axes[1].axhline(0, color="#999999", lw=1.0)
+    axes[1].set_xlabel("Lag applied to StO2 (minutes)")
+    axes[1].set_ylabel("Correlation between PSi and StO2")
+    axes[1].set_title("Every patient's correlation curve, and their mean",
+                      fontsize=11)
+    axes[1].grid(True, color="#e0e0e0", lw=0.6)
+    axes[1].set_axisbelow(True)
+
+    verdict = (f"median lag {summary['median']:+.2f} min "
+               f"(95% CI {low:+.2f} to {high:+.2f})")
+    if low <= 0.0 <= high:
+        verdict += " — spans zero, so no clear lead or lag"
+    elif summary["median"] < 0:
+        verdict += " — StO2 LEADS PSi"
+    else:
+        verdict += " — StO2 FOLLOWS PSi"
+    figure.suptitle(
+        "Lag measured from the whole waveform, not from a chosen event\n"
+        + verdict, fontsize=13)
+
+    figure.tight_layout(rect=(0, 0.13, 1, 0.88))
+    figure.text(
+        0.5, 0.085,
+        f"n = {summary['n']} patients   |   "
+        f"{summary['moderate']} with |r| >= 0.3   |   "
+        f"{summary['strong']} with |r| >= 0.5\n"
+        f"Each patient's PSi and StO2 traces are slid against each other; the "
+        f"lag plotted is the shift that best aligns them.\n"
+        f"PSi falls while StO2 rises, so the best alignment is the most "
+        f"negative correlation.",
+        ha="center", va="top", fontsize=9, linespacing=1.6, color="#333333")
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    return summary
+
+
+# --------------------------------------------------------------------------- #
+# Three-signal timing map
+# --------------------------------------------------------------------------- #
+
+def make_timing_map_figure(merged: pd.DataFrame, order: list[str],
+                           args: argparse.Namespace,
+                           output_path: Path) -> dict:
+    """Where PSi, StO2 and MAP each turn, within the same patient.
+
+    The ladder shows every patient's three event times joined up, so the
+    ordering is visible per patient rather than only on average; the forest
+    beside it gives each pairwise difference with an interval.
+    """
+    figure, axes = plt.subplots(2, 2, figsize=(15, 10.5))
+    results: dict = {}
+
+    # Order the columns by median half-way time, so the ladder reads
+    # left-to-right in the order the signals actually turn. The same order is
+    # kept in the second row even if its medians disagree, because comparing
+    # the two rows is the point and a reshuffle would hide any disagreement.
+    order = sorted(order, key=lambda name: merged[f"t50_{name.lower()}"].median())
+
+    for row, (measure, nice) in enumerate((("t50", "time to half the change"),
+                                           ("t_extreme", "time of the extreme"))):
+        columns = [f"{measure}_{name.lower()}" for name in order]
+        data = merged[["subject_id"] + columns].dropna()
+
+        ladder = axes[row][0]
+        positions = np.arange(len(order))
+        for values in data[columns].to_numpy(float):
+            ladder.plot(positions, values, color="#999999", alpha=0.35, lw=0.8,
+                        marker="o", markersize=3, zorder=2)
+        for position, name in zip(positions, order):
+            column = f"{measure}_{name.lower()}"
+            ladder.scatter([position], [data[column].median()], s=170,
+                           color=SIGNAL_COLORS[name], zorder=4,
+                           edgecolors="black", linewidths=1.0)
+            ladder.vlines(position, data[column].quantile(0.25),
+                          data[column].quantile(0.75),
+                          color=SIGNAL_COLORS[name], lw=6, alpha=0.45, zorder=3)
+        ladder.set_xticks(positions)
+        ladder.set_xticklabels(order)
+        ladder.set_ylabel("Minutes after induction")
+        ladder.set_title(f"{'AB'[row]}1. Each patient's {nice}\n"
+                         f"grey line = one patient; dot = median, bar = IQR",
+                         fontsize=11)
+        ladder.grid(True, axis="y", color="#e0e0e0", lw=0.6)
+        ladder.set_axisbelow(True)
+
+        forest = axes[row][1]
+        pairs = [(order[i], order[j])
+                 for i in range(len(order)) for j in range(i + 1, len(order))]
+        labels, entries = [], []
+        for first, second in pairs:
+            entry = paired_difference(data, f"{measure}_{first.lower()}",
+                                      f"{measure}_{second.lower()}", args.seed)
+            if entry is None:
+                continue
+            entries.append(entry)
+            labels.append(f"{second} − {first}")
+        results[measure] = dict(zip(labels, entries))
+
+        for index, entry in enumerate(entries):
+            crosses = entry["ci"][0] <= 0.0 <= entry["ci"][1]
+            color = "#999999" if crosses else "#d1495b"
+            forest.plot(entry["ci"], [index, index], color=color, lw=3,
+                        solid_capstyle="round", zorder=3)
+            forest.scatter([entry["difference"]], [index], s=90, color=color,
+                           zorder=4, edgecolors="black", linewidths=0.8)
+        forest.axvline(0, color="black", ls="--", lw=1.4, zorder=2)
+        forest.set_yticks(range(len(labels)))
+        forest.set_yticklabels(labels)
+        forest.invert_yaxis()
+        forest.set_xlabel("Minutes (positive = the second signal came later)")
+        forest.set_title(f"{'AB'[row]}2. Paired difference, {nice}\n"
+                         f"grey = interval crosses zero, so no clear ordering",
+                         fontsize=11)
+        forest.grid(True, axis="x", color="#e0e0e0", lw=0.6)
+        forest.set_axisbelow(True)
+
+    figure.suptitle(
+        "Three-signal timing map — PSi, cerebral StO2 and MAP in the same "
+        "patient\nwhich signal turns first, and by how much",
+        fontsize=14)
+    figure.tight_layout(rect=(0, 0, 1, 0.93))
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
 
@@ -898,19 +1274,43 @@ def main() -> int:
               f"patient's extreme is looked for. Pass --search-minutes 0 to "
               f"search the whole record.")
 
-    tables, audits = {}, {}
-    for series, filepaths in (("PSi", args.filepaths),
-                              ("StO2", args.sto2_filepaths)):
-        tables[series], audits[series] = measure_patients(filepaths, series,
-                                                          args, events)
+    map_list = resolve_map_list(args.map_filepaths, args.redcap.parent)
+    if map_list is None:
+        banner("Beat-to-beat MAP: not found — the MAP figure will be skipped")
+        if args.map_filepaths is not None:
+            print(f"  --map-filepaths was given but does not exist: "
+                  f"{args.map_filepaths}")
+        else:
+            print(f"  Looked in {args.redcap.parent} for: "
+                  f"{', '.join(MAP_LIST_FALLBACKS)}")
+        print("  Pass --map-filepaths <file> to include MAP. Everything else "
+              "runs as normal.")
+    else:
+        print(f"\nBeat-to-beat MAP list: {map_list}")
+
+    grid = ccf_grid(args)
+    wanted = [("PSi", args.filepaths), ("StO2", args.sto2_filepaths)]
+    if map_list is not None:
+        wanted.append(("MAP", map_list))
+
+    tables, audits, traces = {}, {}, {}
+    for series, filepaths in wanted:
+        tables[series], audits[series], traces[series] = measure_patients(
+            filepaths, series, args, events, grid)
         report_series(series, tables[series], audits[series])
 
     if tables["PSi"].empty or tables["StO2"].empty:
         sys.stderr.write("\nOne of the signals produced no patients.\n")
         return 1
 
-    merged = tables["PSi"].merge(tables["StO2"], on="subject_id",
-                                 suffixes=("_psi", "_sto2"))
+    def tag(table: pd.DataFrame, name: str) -> pd.DataFrame:
+        """Suffix every measurement column so three tables can be merged."""
+        return table.rename(columns={column: f"{column}_{name.lower()}"
+                                     for column in table.columns
+                                     if column != "subject_id"})
+
+    merged = tag(tables["PSi"], "PSi").merge(tag(tables["StO2"], "StO2"),
+                                             on="subject_id")
 
     # ---- who is furthest out, so an exclusion can be chosen by name ---------
     banner("Most extreme event times (candidates for --exclude)")
@@ -1055,7 +1455,71 @@ def main() -> int:
               + (f" (95% CI {ci[0]:+.3f} to {ci[1]:+.3f})" if ci else "")
               + f"  Spearman rho={entry['spearman']:+.3f}")
 
-    print(f"\nFigure: {figure_path}")
+    written = [figure_path]
+
+    # ---- figure 2: the lag read off the whole waveform ---------------------
+    ccf_table, lags, curves = cross_correlation_lags(
+        traces["PSi"], traces["StO2"], grid, args)
+    ccf_table = ccf_table.loc[ccf_table["subject_id"].isin(merged["subject_id"])]
+    banner("CROSS-CORRELATION — the lag measured from the whole waveform")
+    if len(ccf_table) < 5:
+        print("  Too few patients with overlapping traces.")
+    else:
+        ccf_path = args.outdir / "psi_sto2_crosscorrelation.png"
+        ccf = make_ccf_figure(ccf_table, lags, curves, args, ccf_path)
+        written.append(ccf_path)
+        print(f"  n = {ccf['n']} patients "
+              f"({ccf['moderate']} with |r| >= 0.3, {ccf['strong']} >= 0.5)")
+        print(f"  median lag {ccf['median']:+.2f} min "
+              f"(95% CI {ccf['ci'][0]:+.2f} to {ccf['ci'][1]:+.2f})"
+              + (f", Wilcoxon p={ccf['p']:.3g}" if "p" in ccf else ""))
+        print("  Negative = StO2 leads PSi. Positive = StO2 follows.")
+        half = stats["gaps"].get("t50")
+        if half is not None:
+            agree = (ccf["median"] < 0) == (half["difference"] < 0)
+            print(f"\n  Half-way crossing said {half['difference']:+.2f} min; "
+                  f"this says {ccf['median']:+.2f} min — "
+                  + ("they AGREE in direction, which is the point of running "
+                     "both: the lag survives a method that never picks an "
+                     "event at all."
+                     if agree else
+                     "they DISAGREE in direction. The event-based number "
+                     "depends on which event is chosen; this one does not, so "
+                     "treat the event-based lag with caution and show both."))
+
+    # ---- figure 3: all three signals on one timing map ----------------------
+    if map_list is not None and not tables["MAP"].empty:
+        merged3 = merged.merge(tag(tables["MAP"], "MAP"), on="subject_id")
+        banner("THREE-SIGNAL TIMING MAP — PSi, StO2 and MAP together")
+        print(f"  {len(merged3)} patient(s) have all three signals "
+              f"(PSi {len(tables['PSi'])}, StO2 {len(tables['StO2'])}, "
+              f"MAP {len(tables['MAP'])})")
+        if len(merged3) < 5:
+            print("  Too few patients with all three signals for the figure.")
+        else:
+            map_path = args.outdir / "psi_sto2_map_timing_map.png"
+            order = ["PSi", "StO2", "MAP"]
+            timing = make_timing_map_figure(merged3, order, args, map_path)
+            written.append(map_path)
+            for measure, nice in (("t50", "time to half the change"),
+                                  ("t_extreme", "time of the extreme")):
+                print(f"\n  {nice}:")
+                for name in order:
+                    values = merged3[f"{measure}_{name.lower()}"].dropna()
+                    if len(values):
+                        print(f"      {name:<5} median {values.median():6.2f} min "
+                              f"(IQR {values.quantile(.25):.2f}-"
+                              f"{values.quantile(.75):.2f})")
+                for label, entry in timing.get(measure, {}).items():
+                    crosses = entry["ci"][0] <= 0.0 <= entry["ci"][1]
+                    print(f"      {label:<14} {entry['difference']:+6.2f} min "
+                          f"(95% CI {entry['ci'][0]:+.2f} to "
+                          f"{entry['ci'][1]:+.2f})"
+                          + ("  — crosses zero" if crosses else ""))
+
+    banner("Figures written")
+    for path in written:
+        print(f"  {path}")
     return 0
 
 
