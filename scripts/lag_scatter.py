@@ -712,65 +712,68 @@ def difference_sentence(stats: dict | None, event: str) -> str:
 
 def draw_pair_panel(axis, frame: pd.DataFrame, x_column: str, y_column: str,
                     x_label: str, y_label: str, title: str, subtitle: str,
-                    seed: int, identity: bool) -> dict:
+                    seed: int, identity: bool) -> tuple[dict, str]:
+    """Draw the dots and lines only.
+
+    Nothing is written inside the axes: the numbers are returned as a caption
+    and placed under the panel by the caller. Boxes floating over a scatter
+    cover the very dots the reader is trying to judge, and on a projector the
+    covered corner is usually where the interesting patients are.
+    """
     data = frame[[x_column, y_column]].dropna()
     axis.scatter(data[x_column], data[y_column], s=46, alpha=0.75,
                  color="#3b6ea5", edgecolors="white", linewidths=0.8, zorder=3)
     stats = correlation_with_ci(data[x_column].to_numpy(float),
                                 data[y_column].to_numpy(float), seed)
 
+    lines: list[str] = []
     if identity and len(data):
         lo = float(min(data[x_column].min(), data[y_column].min()))
         hi = float(max(data[x_column].max(), data[y_column].max()))
         pad = 0.05 * (hi - lo or 1.0)
         axis.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="#777777",
-                  ls="--", lw=1.3, zorder=2, label="y = x (same time in both)")
+                  ls="--", lw=1.3, zorder=2)
         axis.set_xlim(lo - pad, hi + pad)
         axis.set_ylim(lo - pad, hi + pad)
         later = int((data[y_column] > data[x_column]).sum())
-        # Sits below the legend, which occupies the top-left corner.
-        axis.text(0.03, 0.80,
-                  f"{later} of {len(data)} above the line\n"
-                  f"(StO2 event came later)",
-                  transform=axis.transAxes, va="top", ha="left", fontsize=9,
-                  bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc"))
+        lines.append(f"{later} of {len(data)} patients above the line")
+        lines.append("(StO2 event came later)")
 
     if len(data) >= 3:
         slope, intercept = np.polyfit(data[x_column], data[y_column], 1)
         span = np.linspace(data[x_column].min(), data[x_column].max(), 50)
         axis.plot(span, intercept + slope * span, color="#d1495b", lw=2.2,
-                  zorder=4, label="least-squares fit")
+                  zorder=4)
 
-    caption = f"n = {stats['n']} patients"
+    # One short line each: three columns of captions sit side by side under the
+    # figure, so anything wide collides with the neighbouring panel's text.
+    head = [f"n = {stats['n']} patients"]
     if "pearson" in stats:
-        caption += f"\nPearson r = {stats['pearson']:+.2f}"
+        pearson = f"Pearson r = {stats['pearson']:+.2f}"
         if "ci" in stats:
-            caption += f" (95% CI {stats['ci'][0]:+.2f} to {stats['ci'][1]:+.2f})"
-        caption += f"\nSpearman rho = {stats['spearman']:+.2f}"
+            pearson += f"  (95% CI {stats['ci'][0]:+.2f} to {stats['ci'][1]:+.2f})"
+        head.append(pearson)
+        head.append(f"Spearman rho = {stats['spearman']:+.2f}")
         # Pearson is driven by distance, Spearman only by rank, so a wide gap
         # between them means a handful of far-out dots are carrying the
-        # correlation. Say so on the figure rather than letting the r be read
-        # as a cohort result.
+        # correlation. Say so rather than letting r read as a cohort result.
         if abs(stats["pearson"] - stats["spearman"]) > 0.3:
             stats["leverage"] = True
-            caption += ("\n! r and rho disagree — a few outlying\n"
-                        "  patients are driving r; trust rho")
-    axis.text(0.97, 0.03, caption, transform=axis.transAxes, va="bottom",
-              ha="right", fontsize=9,
-              bbox=dict(boxstyle="round,pad=0.4", fc="#f7f7f7", ec="#cccccc"))
+            lines.append("! r and rho disagree — a few outlying")
+            lines.append("patients are driving r; trust rho")
+    lines[:0] = head
 
     axis.set_xlabel(x_label)
     axis.set_ylabel(y_label)
     axis.set_title(f"{title}\n{subtitle}", fontsize=11)
     axis.grid(True, color="#e0e0e0", lw=0.6)
     axis.set_axisbelow(True)
-    axis.legend(loc="upper left", fontsize=8, framealpha=0.95)
-    return stats
+    return stats, "\n".join(lines)
 
 
 def make_figure(merged: pd.DataFrame, args: argparse.Namespace,
                 output_path: Path) -> dict:
-    figure, axes = plt.subplots(1, 3, figsize=(17, 5.8))
+    figure, axes = plt.subplots(1, 3, figsize=(17, 7.8))
     stats = {}
     gaps = {
         "t_extreme": paired_difference(merged, "t_extreme_psi",
@@ -778,28 +781,21 @@ def make_figure(merged: pd.DataFrame, args: argparse.Namespace,
         "t50": paired_difference(merged, "t50_psi", "t50_sto2", args.seed),
     }
 
-    stats["value"] = draw_pair_panel(
+    captions: list[str] = []
+    stats["value"], caption = draw_pair_panel(
         axes[0], merged, "extreme_value_psi", "extreme_value_sto2",
         "Lowest PSi reached", "Highest cerebral StO2 reached (%)",
         "A. Value pair",
         "how far down PSi went vs how far up StO2 went",
         args.seed, identity=False)
-    stats["t_extreme"] = draw_pair_panel(
+    captions.append(caption)
+    stats["t_extreme"], caption = draw_pair_panel(
         axes[1], merged, "t_extreme_psi", "t_extreme_sto2",
         "Minutes after induction that PSi was lowest",
         "Minutes after induction that StO2 was highest",
         "B. Timing pair — when each signal hit its extreme",
         difference_sentence(gaps["t_extreme"], "peaks"),
         args.seed, identity=True)
-    stats["t50"] = draw_pair_panel(
-        axes[2], merged, "t50_psi", "t50_sto2",
-        "Minutes for PSi to fall halfway",
-        "Minutes for StO2 to rise halfway",
-        "C. Timing pair — time to half the change",
-        difference_sentence(gaps["t50"], "gets halfway"),
-        args.seed, identity=True)
-    stats["gaps"] = gaps
-
     # Dots pinned to the search boundary are not turning points; say how many
     # rather than letting them read as data.
     if args.search_minutes:
@@ -807,20 +803,45 @@ def make_figure(merged: pd.DataFrame, args: argparse.Namespace,
         pinned = int(((merged["t_extreme_psi"] >= edge - 0.5)
                       | (merged["t_extreme_sto2"] >= edge - 0.5)).sum())
         if pinned:
-            axes[1].text(
-                0.97, 0.97,
-                f"{pinned} dot(s) sit on the {edge:g} min edge:\n"
-                f"still moving when the search stopped",
-                transform=axes[1].transAxes, va="top", ha="right", fontsize=8,
-                color="#a33", bbox=dict(boxstyle="round,pad=0.3", fc="#fff5f5",
-                                        ec="#e0b4b4"))
+            caption += (f"\n{pinned} dot(s) sit on the {edge:g} min edge —\n"
+                        f"still moving when the search stopped")
+    captions.append(caption)
+    stats["t50"], caption = draw_pair_panel(
+        axes[2], merged, "t50_psi", "t50_sto2",
+        "Minutes for PSi to fall halfway",
+        "Minutes for StO2 to rise halfway",
+        "C. Timing pair — time to half the change",
+        difference_sentence(gaps["t50"], "gets halfway"),
+        args.seed, identity=True)
+    captions.append(caption)
+    stats["gaps"] = gaps
 
     figure.suptitle(
         "PSi and cerebral StO2 paired within patient — one dot per patient\n"
         "each patient contributes one number per signal, so these correlations "
         "are statistically legitimate",
         fontsize=13)
-    figure.tight_layout(rect=(0, 0, 1, 0.88))
+    # Leave the bottom third of the canvas empty: the captions stack under
+    # each panel and the one shared legend sits below all of them, so nothing
+    # is ever written over the data.
+    figure.tight_layout(rect=(0, 0.32, 1, 0.91))
+
+    for axis, caption in zip(axes, captions):
+        box = axis.get_position()
+        figure.text(box.x0 + box.width / 2.0, 0.275, caption, ha="center",
+                    va="top", fontsize=9, linespacing=1.6, color="#333333")
+
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([], [], marker="o", ls="none", color="#3b6ea5", markersize=8,
+               markeredgecolor="white", label="one patient"),
+        Line2D([], [], color="#d1495b", lw=2.2, label="least-squares fit"),
+        Line2D([], [], color="#777777", ls="--", lw=1.3,
+               label="y = x — the same time in both signals (panels B and C)"),
+    ]
+    figure.legend(handles=handles, loc="lower center", ncol=3, frameon=False,
+                  fontsize=10, bbox_to_anchor=(0.5, 0.02))
+
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(figure)
     return stats
