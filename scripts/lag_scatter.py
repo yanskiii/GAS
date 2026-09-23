@@ -145,10 +145,13 @@ def parse_args() -> argparse.Namespace:
         "--outdir", type=Path, default=base / "output",
         help="Where the figure is written. No CSVs are produced.")
     parser.add_argument(
-        "--search-minutes", type=float, default=None,
-        help="Optional: only look for each patient's extreme within this many "
-             "minutes after induction. Off by default -- the whole "
-             "intraoperative record is searched.")
+        "--search-minutes", type=float, default=20.0,
+        help="Look for each patient's extreme within this many minutes after "
+             "induction (default 20). This does NOT exclude patients -- every "
+             "patient still gets a dot; it only stops the search wandering "
+             "hours past induction into the maintenance phase, which is a "
+             "different event from the one being measured. Pass 0 to search "
+             "the whole record.")
     parser.add_argument(
         "--baseline-minutes", type=float, default=None,
         help="Optional: use only the last N minutes before induction as the "
@@ -552,7 +555,7 @@ def measure_patients(filepaths: Path, series: str, args: argparse.Namespace,
         smoothed = frame["value"].rolling(width, center=True, min_periods=1).median()
 
         after = frame["minutes"] >= 0.0
-        if args.search_minutes is not None:
+        if args.search_minutes:
             after &= frame["minutes"] <= args.search_minutes
         if int(after.sum()) < args.min_samples:
             record["status"] = (f"fewer than {args.min_samples} samples after "
@@ -778,11 +781,16 @@ def main() -> int:
     print(f"\nREDCap: {len(events)} patients; induction time for "
           f"{int(events['induction'].notna().sum())}, OR-entry for "
           f"{int(events['or_entry'].notna().sum())}")
-    if args.search_minutes is None:
-        print("Search window: the whole record from induction onward "
-              "(no time limit).")
+    if not args.search_minutes:
+        print("Search window: the whole record from induction onward (NO "
+              "LIMIT).\n  Warning: over a long case the lowest PSi is usually "
+              "a maintenance-phase event, not the induction response, so the "
+              "timing panels will largely measure how long each case ran.")
     else:
-        print(f"Search window: induction to +{args.search_minutes:g} min.")
+        print(f"Search window: induction to +{args.search_minutes:g} min. "
+              f"No patient is excluded by this -- it only bounds where each "
+              f"patient's extreme is looked for. Pass --search-minutes 0 to "
+              f"search the whole record.")
 
     tables, audits = {}, {}
     for series, filepaths in (("PSi", args.filepaths),
@@ -860,26 +868,39 @@ def main() -> int:
     late = merged.loc[(merged["t_extreme_psi"] > 60)
                       | (merged["t_extreme_sto2"] > 60), "subject_id"]
     if len(late):
-        print(f"\n  {len(late)} patient(s) have an extreme more than an hour "
-              f"after induction, which is likely a maintenance-phase event "
-              f"rather than an induction one. Use --search-minutes to exclude "
-              f"them if that matters:")
+        share = 100.0 * len(late) / len(merged)
+        print(f"\n  {len(late)} of {len(merged)} patients ({share:.0f}%) have "
+              f"an extreme more than an hour after induction.")
+        if share >= 25.0:
+            print(f"  !! At {share:.0f}% this is not a handful of outliers, it "
+                  f"is most of the cohort, and excluding them one by one would "
+                  f"be gerrymandering. It means the search is reaching past "
+                  f"induction into maintenance. Lower --search-minutes rather "
+                  f"than excluding patients.")
         print(f"    {', '.join(sorted(late))}")
 
-    banner("Is the extreme a real turning point, or just the end of the record?")
+    edge = "searched span" if args.search_minutes else "record"
+    banner(f"Is the extreme a real turning point, or just the end of the {edge}?")
+    worst = 0.0
     for series, column in (("PSi", "min_before_record_end_psi"),
                            ("StO2", "min_before_record_end_sto2")):
         at_end = merged.loc[merged[column] <= 2.0, "subject_id"]
         share = 100.0 * len(at_end) / len(merged) if len(merged) else 0.0
+        worst = max(worst, share)
         print(f"  {series:<5} {len(at_end):>3} of {len(merged)} patients "
               f"({share:.0f}%) have their extreme within the last 2 minutes "
-              f"of their record")
-    print("\n  A high share means the trace was still drifting when recording "
-          "stopped, so its 'extreme' is really 'wherever it had got to by the "
-          "end' rather than a response to induction. If that is common for "
-          "StO2, --search-minutes 20 gives the induction-phase answer instead, "
-          "and panel C is unaffected either way because a half-way crossing "
-          "does not depend on where the record ends.")
+              f"of the {edge}")
+    print(f"\n  A patient counted here was still drifting when the {edge} "
+          f"ended, so their 'extreme' is really 'wherever it had got to by "
+          f"then' rather than a turning point.")
+    if worst >= 25.0:
+        print(f"\n  !! {worst:.0f}% is high. For those patients panel B is "
+              f"partly reporting where the {edge} ends rather than when the "
+              f"signal turned, which flattens the spread and drags the dots "
+              f"toward one edge. Panel C does not have this problem -- a "
+              f"half-way crossing happens on the way to the extreme, so it "
+              f"does not care where the search stops. Prefer panel C for the "
+              f"lag claim, and treat panel B as support.")
 
     figure_path = args.outdir / "psi_sto2_lag_scatter.png"
     stats = make_figure(merged, args, figure_path)
