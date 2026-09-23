@@ -1476,16 +1476,26 @@ def main() -> int:
         print("  Negative = StO2 leads PSi. Positive = StO2 follows.")
         half = stats["gaps"].get("t50")
         if half is not None:
-            agree = (ccf["median"] < 0) == (half["difference"] < 0)
             print(f"\n  Half-way crossing said {half['difference']:+.2f} min; "
-                  f"this says {ccf['median']:+.2f} min — "
-                  + ("they AGREE in direction, which is the point of running "
-                     "both: the lag survives a method that never picks an "
-                     "event at all."
-                     if agree else
-                     "they DISAGREE in direction. The event-based number "
-                     "depends on which event is chosen; this one does not, so "
-                     "treat the event-based lag with caution and show both."))
+                  f"this says {ccf['median']:+.2f} min.")
+            # Matching signs mean nothing when one of the two estimates cannot
+            # be told apart from zero, so check that FIRST. Reporting sign
+            # agreement here would dress a null up as a confirmation.
+            if ccf["ci"][0] <= 0.0 <= ccf["ci"][1]:
+                print("  !! The cross-correlation does NOT detect a lag: its "
+                      "interval includes zero. Matching signs are not "
+                      "confirmation when one estimate is indistinguishable "
+                      "from zero. The event-based lag is UNCONFIRMED by the "
+                      "method that does not pick an event — report it as "
+                      "definition-dependent, not as a cohort lag.")
+            elif (ccf["median"] < 0) == (half["difference"] < 0):
+                print("  They agree in direction AND the cross-correlation "
+                      "excludes zero, so the lag survives a method that never "
+                      "picks an event at all. That is a real confirmation.")
+            else:
+                print("  !! They DISAGREE in direction, and both exclude zero. "
+                      "The event-based number depends on which event is "
+                      "chosen; this one does not. Trust this one.")
 
     # ---- figure 3: all three signals on one timing map ----------------------
     if map_list is not None and not tables["MAP"].empty:
@@ -1516,6 +1526,32 @@ def main() -> int:
                           f"(95% CI {entry['ci'][0]:+.2f} to "
                           f"{entry['ci'][1]:+.2f})"
                           + ("  — crosses zero" if crosses else ""))
+
+            # MAP often falls for far longer than PSi or StO2, so it is the
+            # signal most likely to still be dropping when the search stops.
+            # An extreme pinned to the edge also understates the total change,
+            # which drags the half-way crossing EARLIER -- the direction that
+            # would manufacture a "MAP moves first" result.
+            if args.search_minutes:
+                banner("Is MAP still falling when the search stops?")
+                for name in order:
+                    column = f"min_before_record_end_{name.lower()}"
+                    if column not in merged3:
+                        continue
+                    at_edge = merged3.loc[merged3[column] <= 2.0, "subject_id"]
+                    share = 100.0 * len(at_edge) / len(merged3)
+                    print(f"  {name:<5} {len(at_edge):>3} of {len(merged3)} "
+                          f"({share:.0f}%) reach their extreme in the last 2 "
+                          f"minutes of the {args.search_minutes:g} min window")
+                map_column = "min_before_record_end_map"
+                if map_column in merged3:
+                    map_share = 100.0 * (merged3[map_column] <= 2.0).mean()
+                    if map_share >= 20.0:
+                        print(f"\n  !! {map_share:.0f}% of MAP extremes sit at "
+                              f"the edge, so MAP's total fall is understated "
+                              f"for those patients and its half-way time is "
+                              f"pulled earlier. Re-run with --search-minutes "
+                              f"45 or 60 before claiming MAP moves first.")
 
     banner("Figures written")
     for path in written:
