@@ -72,10 +72,20 @@ Measuring the lag
 
 Output
 ------
-  Two PNGs:
+  Three PNGs:
     <signals>_vs_time_scatter.png                   absolute values
     <signals>_vs_time_scatter_baseline_adjusted.png each patient as % change
                                                     from their own preop baseline
+    <signals>_paired_per_patient.png                ONE DOT PER PATIENT: the
+                                                    value pair (lowest PSi vs
+                                                    peak StO2) and the timing
+                                                    pair (when each happened),
+                                                    plus a time-to-50% variant.
+                                                    Correlations are legitimate
+                                                    here and nowhere else in
+                                                    this script, because each
+                                                    patient contributes exactly
+                                                    one point.
   Everything else -- per-patient windows, exclusions, ID repairs, baselines, the
   lag readouts and the summary statistics -- is printed to the terminal.
 
@@ -873,6 +883,10 @@ def per_patient_response(points: pd.DataFrame, args: argparse.Namespace) -> pd.D
 
         row = {"subject_id": subject_id, "baseline": round(baseline, 2),
                "change": round(change, 2),
+               # The extreme the patient actually reached (lowest PSi / peak
+               # StO2) and the minute it happened. Read off the smoothed trace,
+               # so a single noisy sample cannot define a patient's nadir.
+               "extreme_value": round(float(smooth[extreme_index]), 2),
                "t_extreme": round(float(times[extreme_index]), 2)}
         rising = change > 0
         for name, fraction in (("t10", 0.10), ("t50", 0.50), ("t90", 0.90)):
@@ -1165,6 +1179,155 @@ def draw_panel(axis, panel: dict, args: argparse.Namespace,
             pass
 
 
+def correlation_with_ci(x: np.ndarray, y: np.ndarray, seed: int,
+                        n_boot: int = 2000) -> dict:
+    """Pearson and Spearman with a bootstrap CI.
+
+    Each point is already one patient, so resampling points IS resampling
+    patients -- the pseudo-replication problem that rules out a correlation on
+    the sample-level scatter does not arise here. That is the whole reason this
+    figure exists.
+    """
+    frame = pd.DataFrame({"x": x, "y": y}).dropna()
+    result = {"n": len(frame)}
+    if len(frame) < 5:
+        return result
+    result["pearson"] = float(frame["x"].corr(frame["y"]))
+    result["spearman"] = float(frame["x"].corr(frame["y"], method="spearman"))
+
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0, len(frame), size=(n_boot, len(frame)))
+    values = frame.to_numpy()
+    estimates = []
+    for row in draws:
+        sample = values[row]
+        if np.std(sample[:, 0]) < 1e-12 or np.std(sample[:, 1]) < 1e-12:
+            continue
+        estimates.append(np.corrcoef(sample[:, 0], sample[:, 1])[0, 1])
+    if estimates:
+        result["ci"] = tuple(np.percentile(estimates, [2.5, 97.5]))
+    return result
+
+
+def draw_pair_panel(axis, frame: pd.DataFrame, x_column: str, y_column: str,
+                    x_label: str, y_label: str, title: str, subtitle: str,
+                    args: argparse.Namespace, identity: bool) -> dict:
+    data = frame[[x_column, y_column]].dropna()
+    axis.scatter(data[x_column], data[y_column], s=46, alpha=0.75,
+                 color="#3b6ea5", edgecolors="white", linewidths=0.8, zorder=3)
+
+    stats = correlation_with_ci(data[x_column].to_numpy(float),
+                                data[y_column].to_numpy(float), args.seed)
+
+    if identity and len(data):
+        # Where a patient sits relative to y = x is the whole question: above
+        # the line, StO2's event came later than PSi's in that same patient.
+        lo = float(min(data[x_column].min(), data[y_column].min()))
+        hi = float(max(data[x_column].max(), data[y_column].max()))
+        pad = 0.05 * (hi - lo or 1.0)
+        axis.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="#777777",
+                  ls="--", lw=1.3, zorder=2, label="y = x (same time in both)")
+        axis.set_xlim(lo - pad, hi + pad)
+        axis.set_ylim(lo - pad, hi + pad)
+        later = int((data[y_column] > data[x_column]).sum())
+        axis.text(0.03, 0.97, f"{later}/{len(data)} above the line",
+                  transform=axis.transAxes, va="top", ha="left", fontsize=9,
+                  bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc"))
+
+    if len(data) >= 3:
+        slope, intercept = np.polyfit(data[x_column], data[y_column], 1)
+        span = np.linspace(data[x_column].min(), data[x_column].max(), 50)
+        axis.plot(span, intercept + slope * span, color="#d1495b", lw=2.2,
+                  zorder=4, label="least-squares fit")
+
+    caption = f"n = {stats['n']} patients"
+    if "pearson" in stats:
+        caption += f"\nPearson r = {stats['pearson']:+.2f}"
+        if "ci" in stats:
+            caption += f" (95% CI {stats['ci'][0]:+.2f} to {stats['ci'][1]:+.2f})"
+        caption += f"\nSpearman rho = {stats['spearman']:+.2f}"
+    axis.text(0.97, 0.03, caption, transform=axis.transAxes, va="bottom",
+              ha="right", fontsize=9,
+              bbox=dict(boxstyle="round,pad=0.4", fc="#f7f7f7", ec="#cccccc"))
+
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.set_title(f"{title}\n{subtitle}", fontsize=11)
+    axis.grid(True, color="#e0e0e0", lw=0.6)
+    axis.set_axisbelow(True)
+    axis.legend(loc="upper left", fontsize=8, framealpha=0.95)
+    return stats
+
+
+def make_paired_figure(panels: list[dict], args: argparse.Namespace,
+                       output_path: Path) -> pd.DataFrame | None:
+    """One dot per patient: the value pair and the timing pair.
+
+    The time-series figures pool tens of thousands of correlated samples, so no
+    correlation drawn on them is legitimate. Collapsing each patient to a single
+    (PSi, StO2) point fixes that, and makes the between-patient question
+    directly visible: do the patients who go deepest also rise most, and do the
+    patients whose PSi turns late also have late StO2?
+    """
+    first, second = panels[0], panels[1]
+    merged = first["timing"].merge(second["timing"], on="subject_id",
+                                   suffixes=("_psi", "_sto2"))
+    if len(merged) < 5:
+        print("\nToo few patients timed in both signals for the paired figure.")
+        return None
+
+    name_x, name_y = first["series"], second["series"]
+    figure, axes = plt.subplots(1, 3, figsize=(17, 5.8))
+
+    stats = {}
+    stats["value"] = draw_pair_panel(
+        axes[0], merged, "extreme_value_psi", "extreme_value_sto2",
+        f"Lowest {name_x} reached", f"Peak {name_y} reached (%)",
+        "A. Value pair",
+        f"how deep {name_x} went vs how high {name_y} went",
+        args, identity=False)
+    stats["t_extreme"] = draw_pair_panel(
+        axes[1], merged, "t_extreme_psi", "t_extreme_sto2",
+        f"Minute of {name_x} nadir", f"Minute of {name_y} peak",
+        "B. Timing pair — when the extremes happened",
+        "above the dashed line = StO2 peaked after PSi bottomed",
+        args, identity=True)
+    stats["t50"] = draw_pair_panel(
+        axes[2], merged, "t50_psi", "t50_sto2",
+        f"{name_x}: minutes to 50% of its change",
+        f"{name_y}: minutes to 50% of its change",
+        "C. Timing pair — time to half the response",
+        "same question as B, but robust to a flat-bottomed trough",
+        args, identity=True)
+
+    figure.suptitle(
+        f"{name_x} and {name_y} paired within patient — one dot per patient\n"
+        f"each patient contributes one number per signal, so these "
+        f"correlations are statistically legitimate",
+        fontsize=13)
+    figure.tight_layout(rect=(0, 0, 1, 0.9))
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+    banner("Paired per-patient scatters (one dot per patient)")
+    labels = {
+        "value": f"A  lowest {name_x} vs peak {name_y}",
+        "t_extreme": f"B  minute of {name_x} nadir vs minute of {name_y} peak",
+        "t50": f"C  time to 50% of change, {name_x} vs {name_y}",
+    }
+    for key, label in labels.items():
+        entry = stats[key]
+        if "pearson" not in entry:
+            print(f"  {label}: too few patients")
+            continue
+        ci = entry.get("ci")
+        print(f"  {label}")
+        print(f"      n={entry['n']}  Pearson r={entry['pearson']:+.3f}"
+              + (f" (95% CI {ci[0]:+.3f} to {ci[1]:+.3f})" if ci else "")
+              + f"  Spearman rho={entry['spearman']:+.3f}")
+    return merged
+
+
 def make_figure(panels: list[dict], args: argparse.Namespace,
                 output_path: Path, value_column: str = "value") -> None:
     figure, axes = plt.subplots(
@@ -1436,10 +1599,20 @@ def main() -> int:
     raw_path = args.outdir / f"{stem}_vs_time_scatter.png"
     adjusted_path = args.outdir / f"{stem}_vs_time_scatter_baseline_adjusted.png"
     make_figure(panels, args, raw_path, "value")
-    print(f"\nFigure (absolute values):   {raw_path}")
     if all(not panel["adjusted_points"].empty for panel in panels):
         make_figure(panels, args, adjusted_path, "adjusted")
-        print(f"Figure (baseline-adjusted): {adjusted_path}")
+
+    paired_path = None
+    if len(timed) == 2:
+        paired_path = args.outdir / f"{stem}_paired_per_patient.png"
+        if make_paired_figure(timed, args, paired_path) is None:
+            paired_path = None
+
+    print(f"\nFigure (absolute values):    {raw_path}")
+    if all(not panel["adjusted_points"].empty for panel in panels):
+        print(f"Figure (baseline-adjusted):  {adjusted_path}")
+    if paired_path is not None:
+        print(f"Figure (paired per patient): {paired_path}")
     return 0
 
 
