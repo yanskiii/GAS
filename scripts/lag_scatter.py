@@ -35,17 +35,32 @@ Why one dot per patient matters
   Collapsing each patient to a single point removes that, which is why the
   confidence intervals here come from a plain bootstrap over the dots.
 
-No time window
---------------
-  The whole intraoperative record is searched. Nothing is cut to a window. The
-  only bound is that the extreme must occur at or after induction. Use
-  --search-minutes if you ever want to restrict it.
+Where the extreme is looked for
+------------------------------
+  Within 20 minutes of induction by default (--search-minutes). This excludes
+  nobody: every patient still gets a dot, the search is simply not allowed to
+  wander past the induction response.
 
-  One caveat worth knowing rather than discovering later: over a long case, the
-  lowest PSi of the whole record may belong to a deep-maintenance episode hours
-  after induction rather than to induction itself. The run prints how late each
-  patient's extreme occurred so this is visible; --search-minutes is the lever
-  if it turns out to matter.
+  That bound is not cosmetic. Searching whole records on the real cohort put 59
+  of 89 patients' extremes more than an hour after induction -- the lowest PSi
+  of a three-hour case is usually a deep-maintenance episode, and the highest
+  StO2 is wherever it had drifted by the end. The timing panels then largely
+  measure how long each case ran. Two thirds of a cohort is not an outlier
+  problem, so the window is the honest lever, not --exclude.
+
+  --search-minutes 0 restores the whole-record search and warns about it.
+
+The lag itself
+--------------
+  The panels show the spread; the paired statistic is the answer. For both
+  timing definitions the run reports the within-patient difference (StO2 minus
+  PSi) with a bootstrap CI over patients and a Wilcoxon signed-rank test, and
+  puts that sentence directly in the panel subtitle.
+
+  The two definitions can legitimately disagree in sign. A slow drifting signal
+  can start moving BEFORE a fast one yet reach its extreme AFTER it, so an
+  earlier half-way crossing alongside a later peak is one coherent story, not a
+  contradiction. The run says so explicitly when it happens.
 
 Data sources
 ------------
@@ -647,6 +662,54 @@ def correlation_with_ci(x: np.ndarray, y: np.ndarray, seed: int,
     return result
 
 
+def paired_difference(frame: pd.DataFrame, x_column: str, y_column: str,
+                      seed: int, n_boot: int = 2000) -> dict | None:
+    """Within-patient difference in event time, StO2 minus PSi.
+
+    Pairing on the patient is what turns a cloud of dots into an answer: each
+    patient acts as their own control, so the wide between-patient spread in
+    absolute timing cancels and only the within-patient ordering is left.
+    """
+    data = frame[[x_column, y_column]].dropna()
+    if len(data) < 5:
+        return None
+    difference = (data[y_column] - data[x_column]).to_numpy(float)
+    rng = np.random.default_rng(seed)
+    draws = rng.choice(difference, size=(n_boot, len(difference)), replace=True)
+    low, high = np.percentile(np.median(draws, axis=1), [2.5, 97.5])
+    result = {
+        "n": len(data),
+        "median_x": float(data[x_column].median()),
+        "median_y": float(data[y_column].median()),
+        "difference": float(np.median(difference)),
+        "ci": (float(low), float(high)),
+    }
+    try:
+        from scipy.stats import wilcoxon
+        result["p"] = float(wilcoxon(difference).pvalue)
+    except Exception:
+        pass
+    return result
+
+
+def difference_sentence(stats: dict | None, event: str) -> str:
+    """Plain-English verdict for a panel subtitle."""
+    if stats is None:
+        return "too few paired patients for a lag estimate"
+    gap = stats["difference"]
+    low, high = stats["ci"]
+    interval = f"(paired, 95% CI {low:+.1f} to {high:+.1f} min)"
+    # An interval straddling zero means the ordering is not established, and
+    # the subtitle must not imply one.
+    if low <= 0.0 <= high:
+        return (f"no clear ordering: StO2 {event} {abs(gap):.1f} min "
+                f"{'later' if gap > 0 else 'earlier'},\nbut the interval "
+                f"spans zero {interval}")
+    return (f"StO2 {event} {abs(gap):.1f} min "
+            f"{'LATER' if gap > 0 else 'EARLIER'} than PSi\n"
+            f"in the same patient {interval}")
+
+
 def draw_pair_panel(axis, frame: pd.DataFrame, x_column: str, y_column: str,
                     x_label: str, y_label: str, title: str, subtitle: str,
                     seed: int, identity: bool) -> dict:
@@ -709,6 +772,12 @@ def make_figure(merged: pd.DataFrame, args: argparse.Namespace,
                 output_path: Path) -> dict:
     figure, axes = plt.subplots(1, 3, figsize=(17, 5.8))
     stats = {}
+    gaps = {
+        "t_extreme": paired_difference(merged, "t_extreme_psi",
+                                       "t_extreme_sto2", args.seed),
+        "t50": paired_difference(merged, "t50_psi", "t50_sto2", args.seed),
+    }
+
     stats["value"] = draw_pair_panel(
         axes[0], merged, "extreme_value_psi", "extreme_value_sto2",
         "Lowest PSi reached", "Highest cerebral StO2 reached (%)",
@@ -720,22 +789,38 @@ def make_figure(merged: pd.DataFrame, args: argparse.Namespace,
         "Minutes after induction that PSi was lowest",
         "Minutes after induction that StO2 was highest",
         "B. Timing pair — when each signal hit its extreme",
-        "above the dashed line = StO2 peaked after PSi bottomed out",
+        difference_sentence(gaps["t_extreme"], "peaks"),
         args.seed, identity=True)
     stats["t50"] = draw_pair_panel(
         axes[2], merged, "t50_psi", "t50_sto2",
         "Minutes for PSi to fall halfway",
         "Minutes for StO2 to rise halfway",
         "C. Timing pair — time to half the change",
-        "same question as B, steadier when a trace sits near its floor",
+        difference_sentence(gaps["t50"], "gets halfway"),
         args.seed, identity=True)
+    stats["gaps"] = gaps
+
+    # Dots pinned to the search boundary are not turning points; say how many
+    # rather than letting them read as data.
+    if args.search_minutes:
+        edge = float(args.search_minutes)
+        pinned = int(((merged["t_extreme_psi"] >= edge - 0.5)
+                      | (merged["t_extreme_sto2"] >= edge - 0.5)).sum())
+        if pinned:
+            axes[1].text(
+                0.97, 0.97,
+                f"{pinned} dot(s) sit on the {edge:g} min edge:\n"
+                f"still moving when the search stopped",
+                transform=axes[1].transAxes, va="top", ha="right", fontsize=8,
+                color="#a33", bbox=dict(boxstyle="round,pad=0.3", fc="#fff5f5",
+                                        ec="#e0b4b4"))
 
     figure.suptitle(
         "PSi and cerebral StO2 paired within patient — one dot per patient\n"
         "each patient contributes one number per signal, so these correlations "
         "are statistically legitimate",
         fontsize=13)
-    figure.tight_layout(rect=(0, 0, 1, 0.9))
+    figure.tight_layout(rect=(0, 0, 1, 0.88))
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(figure)
     return stats
@@ -904,6 +989,35 @@ def main() -> int:
 
     figure_path = args.outdir / "psi_sto2_lag_scatter.png"
     stats = make_figure(merged, args, figure_path)
+
+    banner("THE LAG — paired within patient (this is the answer to the question)")
+    print("  Each patient is their own control, so the wide spread in absolute "
+          "timing cancels\n  and only the within-patient ordering is left. "
+          "Positive = StO2 event came later.\n")
+    for key, label, event in (("t_extreme", "peak / lowest point", "peaks"),
+                              ("t50", "half-way crossing", "gets halfway")):
+        entry = stats["gaps"].get(key)
+        if entry is None:
+            print(f"  {label}: too few paired patients")
+            continue
+        print(f"  {label} (n={entry['n']})")
+        print(f"      PSi median {entry['median_x']:.2f} min, "
+              f"StO2 median {entry['median_y']:.2f} min")
+        print(f"      paired difference {entry['difference']:+.2f} min "
+              f"(95% CI {entry['ci'][0]:+.2f} to {entry['ci'][1]:+.2f})"
+              + (f", Wilcoxon p={entry['p']:.3g}" if "p" in entry else ""))
+    both = [stats["gaps"].get("t_extreme"), stats["gaps"].get("t50")]
+    if all(entry is not None for entry in both):
+        peak_gap, half_gap = both[0]["difference"], both[1]["difference"]
+        if peak_gap * half_gap < 0:
+            print(f"\n  Note: the two measures point OPPOSITE ways "
+                  f"({half_gap:+.2f} min at the half-way crossing, "
+                  f"{peak_gap:+.2f} min at the extreme). That is not a "
+                  f"contradiction: it means StO2 starts moving "
+                  f"{'before' if half_gap < 0 else 'after'} PSi but finishes "
+                  f"{'after' if peak_gap > 0 else 'before'} it, which is what "
+                  f"a slow drifting signal does against a fast step. Report "
+                  f"both.")
 
     banner("Correlations (one dot per patient)")
     labels = {"value": "A  lowest PSi vs highest StO2",
