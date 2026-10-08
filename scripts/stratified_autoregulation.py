@@ -151,13 +151,23 @@ def parse_args() -> argparse.Namespace:
                         help="REDCap labeled export with induction and OR entry.")
     parser.add_argument("--outdir", type=Path, default=base / "output",
                         help="Where the figures are written. No CSVs.")
-    parser.add_argument("--min-minutes", type=float, default=-10.0,
-                        help="Earliest minute relative to induction to use "
-                             "(default -10).")
-    parser.add_argument("--max-minutes", type=float, default=180.0,
-                        help="Latest minute after induction to use (default "
-                             "180). Autoregulation needs a spread of MAP "
-                             "values, which takes most of a case to see.")
+    parser.add_argument("--min-minutes", type=float, default=None,
+                        help="Optional earliest minute relative to induction. "
+                             "Unset by default: every valid sample is used, "
+                             "however far it sits from induction.")
+    parser.add_argument("--max-minutes", type=float, default=None,
+                        help="Optional latest minute after induction. Unset by "
+                             "default -- autoregulation needs a wide spread of "
+                             "MAP values, and cutting the record throws that "
+                             "spread away.")
+    parser.add_argument("--max-hours", type=float, default=24.0,
+                        help="Sanity cap on how long one patient's record may "
+                             "span (default 24 h). Guards against a file whose "
+                             "clock is days out, not against real data.")
+    parser.add_argument("--sto2-channels", default="1,2",
+                        help="StO2 channels to average when valid (default "
+                             "1,2). A row with only one valid channel uses "
+                             "that channel alone.")
     parser.add_argument("--step-seconds", type=float, default=10.0,
                         help="Grid all signals are resampled onto (default 10 s).")
     parser.add_argument("--max-gap-seconds", type=float, default=60.0,
@@ -201,37 +211,76 @@ def parse_args() -> argparse.Namespace:
 # this file can be copied to the cluster on its own)
 # --------------------------------------------------------------------------- #
 
-def read_table(path: str) -> tuple[pd.DataFrame, str]:
-    """Read a monitor CSV whatever encoding it was written in.
+def guess_encodings(path: str) -> list[str]:
+    """Encodings to try, narrowed by the byte-order mark when there is one.
 
-    Monitor exports are not reliably UTF-8: the Hemosphere files are written by
-    a Windows device and fail to decode as UTF-8 part-way through the first
-    line. The byte-order mark settles UTF-16 and UTF-8-with-BOM outright;
-    otherwise UTF-8 is tried first so nothing changes for files that were
-    already fine, then cp1252, then latin-1, which cannot fail to decode. Only
-    numbers and timestamps are read from these files, so a mangled character in
-    a text column costs nothing.
-
-    A file that comes back as a single column was split on the wrong character,
-    so the separator is sniffed on a second pass.
+    Monitor exports are not reliably UTF-8 -- the Hemosphere files come off a
+    Windows device and fail to decode part-way through a line. A BOM settles
+    UTF-16 and UTF-8-with-BOM outright; otherwise UTF-8 is tried first so
+    nothing changes for files that were already fine, then cp1252, then
+    latin-1, which cannot fail to decode. Only numbers and timestamps are read
+    from these files, so a mangled character in a text column costs nothing.
     """
     with open(path, "rb") as handle:
         signature = handle.read(4)
     if signature[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        encodings = ["utf-16", "utf-16-le", "utf-16-be"]
-    elif signature[:3] == b"\xef\xbb\xbf":
-        encodings = ["utf-8-sig"]
-    else:
-        encodings = ["utf-8", "cp1252", "latin-1"]
+        return ["utf-16", "utf-16-le", "utf-16-be"]
+    if signature[:3] == b"\xef\xbb\xbf":
+        return ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+    return ["utf-8", "cp1252", "latin-1"]
 
+
+def locate_header(lines: list[str], expect: tuple[str, ...]) -> tuple[int, str]:
+    """Which line is the real header, and what separates its fields.
+
+    Monitor exports put a preamble above the table -- patient and export
+    details, sometimes only one field wide. pandas then reads that first line
+    as the header and throws "Expected 1 fields in line 3, saw 2" the moment a
+    real data row arrives. Scanning for the line that actually carries the
+    column names fixes it for every variant of the preamble at once, which
+    guessing a fixed number of rows to skip would not.
+    """
+    wanted = {name.strip().lower() for name in expect}
+    best = (0, ",", -1.0)
+    for separator in (",", "\t", ";", "|"):
+        for index, line in enumerate(lines):
+            fields = [field.strip().strip('"').lower()
+                      for field in line.rstrip("\r\n").split(separator)]
+            if len(fields) < 2:
+                continue
+            hits = len(wanted & set(fields))
+            # Prefer the line matching the most expected names; fall back to
+            # the widest line that looks like text rather than numbers.
+            score = hits * 100 + len(fields)
+            if hits == 0 and any(field.replace(".", "").replace("-", "").isdigit()
+                                 for field in fields if field):
+                continue
+            if score > best[2]:
+                best = (index, separator, score)
+    return best[0], best[1]
+
+
+def read_table(path: str, expect: tuple[str, ...] = ()) -> tuple[pd.DataFrame, str]:
+    """Read a monitor CSV whatever encoding, preamble or separator it uses."""
     failure: Exception | None = None
-    for encoding in encodings:
+    for encoding in guess_encodings(path):
         try:
+            with open(path, "r", encoding=encoding, newline="") as handle:
+                head = [next(handle) for _ in range(400)]
+        except StopIteration:
+            with open(path, "r", encoding=encoding, newline="") as handle:
+                head = handle.readlines()
+        except Exception as exc:
+            failure = exc
+            continue
+        try:
+            skip, separator = locate_header(head, expect)
             frame = pd.read_csv(path, low_memory=False, skipinitialspace=True,
-                                encoding=encoding)
+                                encoding=encoding, sep=separator, skiprows=skip)
             if frame.shape[1] <= 1:
                 frame = pd.read_csv(path, sep=None, engine="python",
-                                    skipinitialspace=True, encoding=encoding)
+                                    skipinitialspace=True, encoding=encoding,
+                                    skiprows=skip)
             return frame, encoding
         except Exception as exc:
             failure = exc
@@ -421,8 +470,17 @@ def anchor_clock_only(timestamp: pd.Series, induction: pd.Timestamp) -> pd.Serie
 
 
 def load_sedline(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
-    frame, _encoding = read_table(path)
-    value_column = find_column(frame, "psi")
+    frame, _encoding = read_table(path, ("psi (sedline) value", "date", "time"))
+    frame.columns = [str(column).strip() for column in frame.columns]
+    # The Sedline export also carries event columns whose names begin "PSi".
+    # Match the value column exactly, and only fall back to a prefix that still
+    # demands the word "value", so an events column can never be picked up.
+    value_column = find_exact(frame, "psi (sedline) value")
+    if value_column is None:
+        value_column = next(
+            (column for column in frame.columns
+             if str(column).strip().lower().startswith("psi")
+             and "value" in str(column).lower()), None)
     date_column = find_column(frame, "date")
     time_column = find_column(frame, "time")
     if value_column is None:
@@ -446,15 +504,18 @@ def load_sedline(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
                          "psi": pd.to_numeric(frame[value_column], errors="coerce")})
 
 
-def load_sto2(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
-    frame, _encoding = read_table(path)
+def load_sto2(path: str, induction: pd.Timestamp,
+              channels: tuple[int, ...] = (1, 2)) -> pd.DataFrame | None:
+    frame, _encoding = read_table(path, ("time", "sto2_ch1", "valid_ch1"))
     time_column = find_column(frame, "time")
     if time_column is None:
         return None
     timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
                                errors="coerce", format="mixed")
     present, total, count = 0, pd.Series(0.0, index=frame.index), pd.Series(0, index=frame.index)
-    for channel in STO2_CHANNELS:
+    # Average the channels flagged valid on each row; a row with only one valid
+    # channel contributes that channel alone rather than being dropped.
+    for channel in channels:
         value_column = find_column(frame, f"sto2_ch{channel}")
         if value_column is None:
             continue
@@ -496,7 +557,8 @@ def load_hemosphere(path: str, induction: pd.Timestamp,
     dropped rather than averaged in -- a low-SQI CO is the device telling you
     not to believe it.
     """
-    frame, encoding = read_table(path)
+    frame, encoding = read_table(
+        path, ("timestamp", "date", "time", "technology", "co", "co_sqi"))
     frame.columns = [str(column).strip() for column in frame.columns]
     info: dict = {"columns": list(frame.columns), "rows": len(frame),
                   "encoding": encoding}
@@ -548,7 +610,7 @@ def load_hemosphere(path: str, induction: pd.Timestamp,
 
 def load_map(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
     """Beat-to-beat MAP, with the monitor's own bad-data rows dropped."""
-    frame, _encoding = read_table(path)
+    frame, _encoding = read_table(path, ("meanarterialpressure", "databad", "time"))
     frame.columns = [str(column).strip() for column in frame.columns]
     value_column = find_column(frame, "meanarterial") or find_column(frame, "map")
     time_column = find_exact(frame, "time") or find_column(frame, "time")
@@ -558,7 +620,7 @@ def load_map(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
     keep = pd.Series(True, index=frame.index)
     bad_column = find_column(frame, "databad")
     if bad_column is not None:
-        keep &= pd.to_numeric(frame[bad_column], errors="coerce").ne(1)
+        keep &= pd.to_numeric(frame[bad_column], errors="coerce").eq(0)
 
     timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
                                errors="coerce", format="mixed")
@@ -619,8 +681,9 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
     its full cohort and only the CO split runs on the smaller subset.
     """
     step = float(args.step_seconds) / 60.0
-    grid = np.arange(args.min_minutes, args.max_minutes + step / 2.0, step)
     max_gap = float(args.max_gap_seconds) / 60.0
+    channels = tuple(int(part) for part in str(args.sto2_channels).split(",")
+                     if part.strip())
 
     def index_by_id(filepaths: Path) -> dict[str, str]:
         found: dict[str, str] = {}
@@ -654,7 +717,7 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
 
         try:
             psi_frame = load_sedline(psi_files[subject_id], induction)
-            sto2_frame = load_sto2(sto2_files[subject_id], induction)
+            sto2_frame = load_sto2(sto2_files[subject_id], induction, channels)
             map_frame = load_map(map_files[subject_id], induction)
         except Exception as exc:
             skipped.append(f"{subject_id}: read error: {exc}")
@@ -695,12 +758,44 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
             elif hemo_frame is not None:
                 hemo_report["no_co"].append(subject_id)
 
-        aligned = {"minutes": grid}
+        # Clean each signal first, then build this patient's grid from the
+        # stretch where MAP, StO2 and PSi all actually exist. A fixed window
+        # would discard most of a long case, and the MAP spread that the
+        # autoregulation slope is fitted through is exactly what a narrow
+        # window throws away.
+        prepared: list[tuple[pd.DataFrame, str]] = []
         for frame, column in sources:
             frame = frame.dropna(subset=["timestamp"]).copy()
             frame["minutes"] = (frame["timestamp"] - induction).dt.total_seconds() / 60.0
             low, high = VALID_RANGE[column]
             frame.loc[~frame[column].between(low, high), column] = np.nan
+            frame = frame.dropna(subset=[column])
+            prepared.append((frame, column))
+
+        required = [frame for frame, column in prepared
+                    if column in ("psi", "sto2", "map")]
+        if any(frame.empty for frame in required):
+            skipped.append(f"{subject_id}: a required signal had no valid values")
+            continue
+        start = max(float(frame["minutes"].min()) for frame in required)
+        stop = min(float(frame["minutes"].max()) for frame in required)
+        if args.min_minutes is not None:
+            start = max(start, float(args.min_minutes))
+        if args.max_minutes is not None:
+            stop = min(stop, float(args.max_minutes))
+        if stop <= start:
+            skipped.append(f"{subject_id}: MAP, StO2 and PSi never overlap in time")
+            continue
+        span_hours = (stop - start) / 60.0
+        if span_hours > args.max_hours:
+            skipped.append(f"{subject_id}: records span {span_hours:.1f} h, over "
+                           f"the --max-hours {args.max_hours:g} sanity cap — "
+                           f"check that file's clock")
+            continue
+
+        grid = np.arange(start, stop + step / 2.0, step)
+        aligned = {"minutes": grid}
+        for frame, column in prepared:
             aligned[column] = to_grid(frame, column, grid, max_gap)
 
         patient = pd.DataFrame(aligned).dropna(subset=["map", "sto2", "psi"])
@@ -1077,9 +1172,20 @@ def main() -> int:
             print(f"  {note}")
     print(f"\nREDCap: {len(events)} patients with an induction time for "
           f"{int(events['induction'].notna().sum())}")
-    print(f"Window: {args.min_minutes:g} to {args.max_minutes:g} minutes from "
-          f"induction, resampled every {args.step_seconds:g} s, never "
-          f"interpolating across gaps wider than {args.max_gap_seconds:g} s.")
+    bounds = []
+    if args.min_minutes is not None:
+        bounds.append(f"from {args.min_minutes:g} min")
+    if args.max_minutes is not None:
+        bounds.append(f"to {args.max_minutes:g} min")
+    print("Window: " + (" ".join(bounds) + " relative to induction." if bounds
+                        else "NONE — every valid sample is used, for each "
+                             "patient over the whole stretch where MAP, StO2 "
+                             "and PSi all exist."))
+    print(f"  Resampled every {args.step_seconds:g} s, never interpolating "
+          f"across gaps wider than {args.max_gap_seconds:g} s.")
+    print(f"  Kept: CO where CO_SQI >= {args.min_co_sqi:g}; MAP where "
+          f"databad == 0; PSi where the value is not '-'; StO2 averaged over "
+          f"channels {args.sto2_channels} flagged valid.")
 
     aligned, hemo, skipped = build_aligned(args, events, map_list, hemo_list)
     if aligned.empty:
