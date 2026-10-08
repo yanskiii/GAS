@@ -230,6 +230,51 @@ def guess_encodings(path: str) -> list[str]:
     return ["utf-8", "cp1252", "latin-1"]
 
 
+def score_header(fields: list[str], wanted: set[str]) -> float:
+    """How much a row looks like the column-name row. Negative means "no"."""
+    fields = [field.strip().strip('"').lower() for field in fields]
+    if len(fields) < 2:
+        return -1.0
+    hits = len(wanted & set(fields))
+    if hits == 0 and any(field.replace(".", "").replace("-", "").isdigit()
+                         for field in fields if field):
+        return -1.0          # a row of numbers is data, not a header
+    return hits * 100.0 + len(fields)
+
+
+def read_excel_table(path: str, expect: tuple[str, ...]) -> pd.DataFrame:
+    """Read the sheet and header row that actually hold the measurements.
+
+    The Hemosphere exports are genuine .xlsx workbooks. Handing one to a CSV
+    reader decodes ZIP bytes as text, which is where "Buffer overflow caught"
+    and pages of mojibake column names come from -- the file was never text.
+    """
+    book = pd.ExcelFile(path)
+    wanted = {name.strip().lower() for name in expect}
+    best: tuple[str, int, float] = (book.sheet_names[0], 0, -1.0)
+    for sheet in book.sheet_names:
+        probe = book.parse(sheet, header=None, nrows=40)
+        for index in range(len(probe)):
+            fields = ["" if pd.isna(value) else str(value)
+                      for value in probe.iloc[index].tolist()]
+            score = score_header(fields, wanted)
+            if score > best[2]:
+                best = (sheet, index, score)
+    sheet, header_row, _score = best
+    return book.parse(sheet, header=header_row)
+
+
+def sniff_binary_kind(path: str) -> str | None:
+    """'excel' for a workbook, None for something a text reader can handle."""
+    with open(path, "rb") as handle:
+        signature = handle.read(8)
+    if signature[:4] == b"PK\x03\x04":
+        return "excel"                      # .xlsx / .xlsm are ZIP archives
+    if signature[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return "excel"                      # legacy .xls compound document
+    return None
+
+
 def locate_header(lines: list[str], expect: tuple[str, ...]) -> tuple[int, str]:
     """Which line is the real header, and what separates its fields.
 
@@ -244,24 +289,22 @@ def locate_header(lines: list[str], expect: tuple[str, ...]) -> tuple[int, str]:
     best = (0, ",", -1.0)
     for separator in (",", "\t", ";", "|"):
         for index, line in enumerate(lines):
-            fields = [field.strip().strip('"').lower()
-                      for field in line.rstrip("\r\n").split(separator)]
-            if len(fields) < 2:
-                continue
-            hits = len(wanted & set(fields))
-            # Prefer the line matching the most expected names; fall back to
-            # the widest line that looks like text rather than numbers.
-            score = hits * 100 + len(fields)
-            if hits == 0 and any(field.replace(".", "").replace("-", "").isdigit()
-                                 for field in fields if field):
-                continue
+            score = score_header(line.rstrip("\r\n").split(separator), wanted)
             if score > best[2]:
                 best = (index, separator, score)
     return best[0], best[1]
 
 
 def read_table(path: str, expect: tuple[str, ...] = ()) -> tuple[pd.DataFrame, str]:
-    """Read a monitor CSV whatever encoding, preamble or separator it uses."""
+    """Read a monitor export whatever form it takes.
+
+    Workbook or text, any encoding, any preamble, any separator. The binary
+    check comes first: a .xlsx handed to a text reader decodes as garbage
+    rather than failing cleanly, so sniffing has to happen before decoding.
+    """
+    if sniff_binary_kind(path) == "excel":
+        return read_excel_table(path, expect), "excel"
+
     failure: Exception | None = None
     for encoding in guess_encodings(path):
         try:
@@ -456,6 +499,39 @@ def load_event_times(redcap_path: Path) -> tuple[pd.DataFrame, list[str]]:
     return events, notes
 
 
+def as_datetime(values: pd.Series) -> pd.Series:
+    """Parse a column to datetime, passing one that already is straight through.
+
+    Excel hands back real datetimes, not strings. Round-tripping those through
+    text to re-parse them is both wasteful and a chance to lose them.
+    """
+    if pd.api.types.is_datetime64_any_dtype(values):
+        return values
+    return pd.to_datetime(values.astype("string").str.strip(),
+                          errors="coerce", format="mixed")
+
+
+def combine_date_time(dates: pd.Series, times: pd.Series) -> pd.Series:
+    """Join a date column to a time column, whatever types they arrive as.
+
+    In the .xlsx the date is a midnight datetime and the time is a
+    datetime.time object, so pasting their text together gives
+    "2025-12-09 00:00:00 11:16:12", which parses to nothing.
+    """
+    day = as_datetime(dates).dt.normalize()
+    if pd.api.types.is_datetime64_any_dtype(times):
+        offset = times - times.dt.normalize()
+    else:
+        offset = pd.to_timedelta(times.astype(str).str.strip(), errors="coerce")
+        if offset.isna().all():
+            # "11:16:12 am" style: let the parser handle it, then take the
+            # time of day back off.
+            parsed = pd.to_datetime(times.astype("string").str.strip(),
+                                    errors="coerce", format="mixed")
+            offset = parsed - parsed.dt.normalize()
+    return day + offset
+
+
 def anchor_clock_only(timestamp: pd.Series, induction: pd.Timestamp) -> pd.Series:
     """Re-date bare clock times onto the surgery day and unwrap midnight."""
     if timestamp.isna().all() or pd.isna(induction):
@@ -572,17 +648,12 @@ def load_hemosphere(path: str, induction: pd.Timestamp,
     timestamp = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
     stamp_column = find_exact(frame, "timestamp")
     if stamp_column is not None:
-        timestamp = pd.to_datetime(frame[stamp_column].astype("string").str.strip(),
-                                   errors="coerce", format="mixed")
+        timestamp = as_datetime(frame[stamp_column])
     date_column, time_column = find_exact(frame, "date"), find_exact(frame, "time")
     if timestamp.isna().all() and date_column and time_column:
-        timestamp = pd.to_datetime(
-            frame[date_column].astype("string").str.strip() + " "
-            + frame[time_column].astype("string").str.strip(),
-            errors="coerce", format="mixed")
+        timestamp = combine_date_time(frame[date_column], frame[time_column])
     if timestamp.isna().all() and time_column:
-        timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
-                                   errors="coerce", format="mixed")
+        timestamp = as_datetime(frame[time_column])
     if timestamp.isna().all():
         return None, info
     timestamp = anchor_clock_only(timestamp, induction)
@@ -622,9 +693,7 @@ def load_map(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
     if bad_column is not None:
         keep &= pd.to_numeric(frame[bad_column], errors="coerce").eq(0)
 
-    timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
-                               errors="coerce", format="mixed")
-    timestamp = anchor_clock_only(timestamp, induction)
+    timestamp = anchor_clock_only(as_datetime(frame[time_column]), induction)
     return pd.DataFrame({
         "timestamp": timestamp,
         "map": pd.to_numeric(frame[value_column], errors="coerce"),
@@ -772,11 +841,17 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
             frame = frame.dropna(subset=[column])
             prepared.append((frame, column))
 
-        required = [frame for frame, column in prepared
+        required = [(frame, column) for frame, column in prepared
                     if column in ("psi", "sto2", "map")]
-        if any(frame.empty for frame in required):
-            skipped.append(f"{subject_id}: a required signal had no valid values")
+        empty = [column for frame, column in required if frame.empty]
+        if empty:
+            why = {"map": "no rows with databad == 0 and a plausible pressure",
+                   "sto2": "no rows with a valid channel",
+                   "psi": "every PSi value was '-' or out of range"}
+            skipped.append(f"{subject_id}: {'/'.join(empty).upper()} unusable — "
+                           + "; ".join(why[column] for column in empty))
             continue
+        required = [frame for frame, _column in required]
         start = max(float(frame["minutes"].min()) for frame in required)
         stop = min(float(frame["minutes"].max()) for frame in required)
         if args.min_minutes is not None:
