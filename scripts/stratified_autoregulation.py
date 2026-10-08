@@ -123,6 +123,19 @@ CO_PREFIXES = ("cardiac output", "cardiacoutput", "cardiac_output", "co (",
 
 BAND_COLORS = ["#2f5597", "#548235", "#c55a11", "#7030a0", "#7f6000", "#495057"]
 
+# How each variable is labelled, and how much it must move inside a band before
+# a patient's own slope through it means anything. A line fitted through a
+# near-vertical stripe of points has a huge, meaningless slope.
+AXES = {
+    "map": {"label": "MAP (mmHg)", "short": "MAP", "unit": " mmHg",
+            "min_range": 10.0},
+    "psi": {"label": "PSi", "short": "PSi", "unit": "", "min_range": 10.0},
+    "co": {"label": "Cardiac output (L/min)", "short": "CO", "unit": " L/min",
+           "min_range": 0.8},
+    "sto2": {"label": "Cerebral StO2 (%)", "short": "StO2", "unit": " %",
+             "min_range": 2.0},
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
@@ -194,10 +207,17 @@ def parse_args() -> argparse.Namespace:
                              "that patient gets their own slope there "
                              "(default 60 = 10 min at 10 s).")
     parser.add_argument("--min-map-range", type=float, default=10.0,
-                        help="A patient's MAP must vary by at least this many "
-                             "mmHg inside a band before fitting their slope "
-                             "(default 10). A slope through a vertical stripe "
-                             "of points is meaningless.")
+                        help="When MAP is on the x-axis, a patient's MAP must "
+                             "vary by at least this many mmHg inside a band "
+                             "before their slope is fitted (default 10). A "
+                             "line through a vertical stripe of points is "
+                             "meaningless.")
+    parser.add_argument("--min-psi-range", type=float, default=10.0,
+                        help="The same requirement when PSi is on the x-axis "
+                             "(default 10 PSi units).")
+    parser.add_argument("--map-bins", type=int, default=3,
+                        help="Number of MAP bands used when MAP is the "
+                             "stratifier, cut at quantiles (default 3).")
     parser.add_argument("--plot-sample", type=int, default=20000,
                         help="Points drawn per panel (default 20000). All the "
                              "data is used for the statistics; this only keeps "
@@ -890,40 +910,42 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
 # The two slopes
 # --------------------------------------------------------------------------- #
 
-def pooled_slope(frame: pd.DataFrame) -> dict:
+def pooled_slope(frame: pd.DataFrame, x_column: str, y_column: str) -> dict:
     """One line through every sample in the band -- the figure that was asked for.
 
     Reported, but not trusted: a patient contributes thousands of correlated
     samples, so this is pseudo-replicated and its spread is not interpretable.
     """
-    data = frame[["map", "sto2"]].dropna()
+    data = frame[[x_column, y_column]].dropna()
     if len(data) < 10:
         return {}
-    slope, intercept = np.polyfit(data["map"], data["sto2"], 1)
+    slope, intercept = np.polyfit(data[x_column], data[y_column], 1)
     return {"slope": float(slope), "intercept": float(intercept),
             "n_samples": len(data),
-            "r": float(data["map"].corr(data["sto2"]))}
+            "r": float(data[x_column].corr(data[y_column]))}
 
 
-def within_patient_slopes(frame: pd.DataFrame, args: argparse.Namespace) -> dict:
-    """Each patient's own MAP-to-StO2 slope inside this band, then the median.
+def within_patient_slopes(frame: pd.DataFrame, args: argparse.Namespace,
+                          x_column: str, y_column: str,
+                          min_range: float) -> dict:
+    """Each patient's own slope of y on x inside this band, then the median.
 
-    This is the autoregulation estimate. A patient only contributes if they have
-    enough samples AND enough MAP movement in the band -- fitting a line through
-    a near-vertical stripe of points produces a huge meaningless slope.
+    This is the estimate that answers the physiological question, whichever
+    pair is being related. A patient only contributes if they have enough
+    samples AND enough movement in x within the band.
     """
     per_patient = []
     for subject_id, group in frame.groupby("subject_id"):
-        data = group[["map", "sto2"]].dropna()
+        data = group[[x_column, y_column]].dropna()
         if len(data) < args.min_cell_samples:
             continue
-        spread = float(data["map"].max() - data["map"].min())
-        if spread < args.min_map_range:
+        spread = float(data[x_column].max() - data[x_column].min())
+        if spread < min_range:
             continue
-        slope, _intercept = np.polyfit(data["map"], data["sto2"], 1)
+        slope, _intercept = np.polyfit(data[x_column], data[y_column], 1)
         per_patient.append({"subject_id": subject_id, "slope": float(slope),
-                            "r": float(data["map"].corr(data["sto2"])),
-                            "n": len(data), "map_range": spread})
+                            "r": float(data[x_column].corr(data[y_column])),
+                            "n": len(data), "x_range": spread})
     if len(per_patient) < 5:
         return {"n_patients": len(per_patient)}
 
@@ -994,69 +1016,127 @@ def compare_bands(bands: list[dict], key: str, args: argparse.Namespace) -> dict
 # --------------------------------------------------------------------------- #
 
 def make_stratified_figure(bands: list[dict], variable: str, unit: str,
+                           x_column: str, y_column: str,
                            args: argparse.Namespace, output_path: Path) -> None:
-    columns = max(len(bands), 1)
-    figure = plt.figure(figsize=(4.4 * columns, 9.6))
-    spec = figure.add_gridspec(2, columns, height_ratios=[1.35, 1.0],
-                               hspace=0.42, wspace=0.28)
-    rng = np.random.default_rng(args.seed)
+    """Scatter per band, every band's trendline overlaid, then the slope test.
 
-    sto2_low = min((band["frame"]["sto2"].quantile(0.01) for band in bands
-                    if len(band["frame"])), default=0.0)
-    sto2_high = max((band["frame"]["sto2"].quantile(0.99) for band in bands
-                     if len(band["frame"])), default=100.0)
-    map_low = min((band["frame"]["map"].quantile(0.01) for band in bands
-                   if len(band["frame"])), default=40.0)
-    map_high = max((band["frame"]["map"].quantile(0.99) for band in bands
-                    if len(band["frame"])), default=120.0)
+    The overlay is the view that answers "is the relationship modified?"
+    directly: each band's within-patient slope is drawn through that band's own
+    median, so a vertical offset between lines is a level difference and a
+    difference in tilt is the interaction. The per-band scatters above it show
+    the data those lines summarise.
+    """
+    columns = max(len(bands), 1)
+    figure = plt.figure(figsize=(4.4 * columns, 13.2))
+    spec = figure.add_gridspec(3, 2 * columns,
+                               height_ratios=[1.30, 1.05, 1.05],
+                               hspace=0.55, wspace=1.05)
+    rng = np.random.default_rng(args.seed)
+    x_spec, y_spec = AXES[x_column], AXES[y_column]
+
+    def limits(column: str, fallback: tuple[float, float]) -> tuple[float, float]:
+        values = [band["frame"][column] for band in bands if len(band["frame"])]
+        if not values:
+            return fallback
+        joined = pd.concat(values)
+        return float(joined.quantile(0.01)), float(joined.quantile(0.99))
+
+    x_low, x_high = limits(x_column, (0.0, 100.0))
+    y_low, y_high = limits(y_column, (0.0, 100.0))
+    span = np.linspace(x_low, x_high, 50)
 
     for index, band in enumerate(bands):
-        axis = figure.add_subplot(spec[0, index])
+        axis = figure.add_subplot(spec[0, 2 * index:2 * index + 2])
         data = band["frame"]
         color = BAND_COLORS[index % len(BAND_COLORS)]
-        if len(data) > args.plot_sample:
-            shown = data.iloc[rng.choice(len(data), args.plot_sample, replace=False)]
-        else:
-            shown = data
-        axis.scatter(shown["map"], shown["sto2"], s=3, alpha=0.10,
+        shown = (data.iloc[rng.choice(len(data), args.plot_sample, replace=False)]
+                 if len(data) > args.plot_sample else data)
+        axis.scatter(shown[x_column], shown[y_column], s=3, alpha=0.10,
                      color=color, edgecolors="none", rasterized=True)
 
         pooled = band.get("pooled", {})
         if "slope" in pooled:
-            span = np.linspace(map_low, map_high, 50)
             axis.plot(span, pooled["intercept"] + pooled["slope"] * span,
                       color="#d1495b", lw=2.4,
                       label=f"pooled slope {pooled['slope']:+.3f}")
         within = band.get("within", {})
-        if "median" in within:
-            # Anchor the within-patient line at the band's centre so the two
-            # slopes can be compared by eye without an arbitrary intercept.
-            centre_x = float(data["map"].median())
-            centre_y = float(data["sto2"].median())
-            span = np.linspace(map_low, map_high, 50)
+        if "median" in within and len(data):
+            centre_x, centre_y = float(data[x_column].median()), float(data[y_column].median())
             axis.plot(span, centre_y + within["median"] * (span - centre_x),
                       color="black", lw=2.2, ls="--",
                       label=f"within-patient {within['median']:+.3f}")
 
-        axis.set_xlim(map_low, map_high)
-        axis.set_ylim(sto2_low, sto2_high)
-        axis.set_xlabel("MAP (mmHg)")
+        axis.set_xlim(x_low, x_high)
+        axis.set_ylim(y_low, y_high)
+        axis.set_xlabel(x_spec["label"])
         if index == 0:
-            axis.set_ylabel("Cerebral StO2 (%)")
-        axis.set_title(
-            f"{variable} {band['label']}{unit}\n"
-            f"{len(data):,} samples, {data['subject_id'].nunique()} patients",
-            fontsize=10.5)
+            axis.set_ylabel(y_spec["label"])
+        axis.set_title(f"{variable} {band['label']}{unit}\n"
+                       f"{len(data):,} samples, "
+                       f"{data['subject_id'].nunique()} patients", fontsize=10.5)
         axis.grid(True, color="#e8e8e8", lw=0.6)
         axis.set_axisbelow(True)
         axis.legend(loc="upper left", fontsize=8, framealpha=0.9)
 
-    summary = figure.add_subplot(spec[1, :])
+    overlay = figure.add_subplot(spec[1, :columns])
+    for index, band in enumerate(bands):
+        within, data = band.get("within", {}), band["frame"]
+        if "median" not in within or not len(data):
+            continue
+        centre_x, centre_y = float(data[x_column].median()), float(data[y_column].median())
+        color = BAND_COLORS[index % len(BAND_COLORS)]
+        overlay.plot(span, centre_y + within["median"] * (span - centre_x),
+                     color=color, lw=2.6,
+                     label=f"{variable} {band['label']}{unit}  "
+                           f"(slope {within['median']:+.3f}, "
+                           f"{within['n_patients']} pts)")
+        overlay.scatter([centre_x], [centre_y], s=70, color=color,
+                        edgecolors="black", linewidths=0.9, zorder=4)
+    overlay.set_xlim(x_low, x_high)
+    overlay.set_ylim(y_low, y_high)
+    overlay.set_xlabel(x_spec["label"])
+    overlay.set_ylabel(y_spec["label"])
+    overlay.set_title(f"All {variable} bands together\n"
+                      f"parallel lines = {variable} shifts the level, "
+                      f"not the slope", fontsize=10.5)
+    overlay.grid(True, color="#e8e8e8", lw=0.6)
+    overlay.set_axisbelow(True)
+    overlay.legend(loc="best", fontsize=8, framealpha=0.95)
+
+    # Every patient's own slope, so the median can be judged against the spread
+    # behind it. A median sitting in a gap between two clusters would mean the
+    # cohort holds two behaviours, not one average one.
+    spread = figure.add_subplot(spec[1, columns:])
+    jitter = np.random.default_rng(args.seed)
+    for index, band in enumerate(bands):
+        table = band.get("within", {}).get("table")
+        if table is None:
+            continue
+        values = table["slope"].to_numpy(float)
+        spread.scatter(index + jitter.uniform(-0.13, 0.13, len(values)), values,
+                       s=26, alpha=0.65, color=BAND_COLORS[index % len(BAND_COLORS)],
+                       edgecolors="white", linewidths=0.5, zorder=3)
+        spread.plot([index - 0.26, index + 0.26],
+                    [np.median(values)] * 2, color="black", lw=2.4, zorder=4)
+    spread.axhline(0, color="#777777", ls="--", lw=1.4)
+    spread.set_xticks(np.arange(len(bands)))
+    spread.set_xticklabels([f"{band['label']}{unit}" for band in bands],
+                           fontsize=8)
+    spread.set_xlabel(variable)
+    spread.set_ylabel(f"Each patient's own slope\n"
+                      f"of {y_spec['short']} on {x_spec['short']}")
+    spread.set_title("One dot per patient\nis the median representative?",
+                     fontsize=10.5)
+    spread.grid(True, axis="y", color="#e8e8e8", lw=0.6)
+    spread.set_axisbelow(True)
+
+    summary = figure.add_subplot(spec[1 if columns == 0 else 2, :])
     positions = np.arange(len(bands))
-    pooled_values = [band.get("pooled", {}).get("slope", np.nan) for band in bands]
-    summary.plot(positions, pooled_values, color="#d1495b", lw=2.2, marker="o",
-                 markersize=9, label="pooled slope (every sample — "
-                                     "pseudo-replicated, do not quote)")
+    summary.plot(positions,
+                 [band.get("pooled", {}).get("slope", np.nan) for band in bands],
+                 color="#d1495b", lw=2.2, marker="o", markersize=9,
+                 label="pooled slope (every sample — pseudo-replicated, "
+                       "do not quote)")
     for index, band in enumerate(bands):
         within = band.get("within", {})
         if "median" not in within:
@@ -1066,27 +1146,27 @@ def make_stratified_figure(bands: list[dict], variable: str, unit: str,
         summary.scatter([index], [within["median"]], s=95, color="black",
                         zorder=4,
                         label=("within-patient median with 95% CI "
-                               "(this is the autoregulation estimate)"
+                               "(this is the estimate to quote)"
                                if index == 0 else None))
     summary.axhline(0, color="#777777", ls="--", lw=1.4)
     summary.set_xticks(positions)
     summary.set_xticklabels([f"{variable}\n{band['label']}{unit}\n"
                              f"{band.get('within', {}).get('n_patients', 0)} pts"
                              for band in bands])
-    summary.set_ylabel("Slope of StO2 on MAP\n(% StO2 per mmHg)")
-    summary.set_title(
-        "Slope by band — flat (near 0) = autoregulation intact; "
-        "rising = StO2 follows MAP, so the brain is pressure-passive",
-        fontsize=11)
+    summary.set_ylabel(f"Slope of {y_spec['short']} on {x_spec['short']}\n"
+                       f"({y_spec['unit'].strip() or y_spec['short']} per "
+                       f"{x_spec['unit'].strip() or 'unit'})")
+    summary.set_title(f"Slope by band — a flat series means {variable} does "
+                      f"not modify the {x_spec['short']}-{y_spec['short']} "
+                      f"relationship", fontsize=11)
     summary.grid(True, axis="y", color="#e8e8e8", lw=0.6)
     summary.set_axisbelow(True)
     summary.legend(loc="best", fontsize=9, framealpha=0.95)
 
     figure.suptitle(
-        f"Cerebral StO2 versus MAP, split by {variable}\n"
-        f"does the brain's protection against low blood pressure depend on "
-        f"{variable}?",
-        fontsize=14)
+        f"{y_spec['short']} versus {x_spec['short']}, split by {variable}\n"
+        f"is the {x_spec['short']}-{y_spec['short']} relationship modified by "
+        f"{variable}?", fontsize=14)
     figure.savefig(output_path, dpi=170, bbox_inches="tight")
     plt.close(figure)
 
@@ -1102,24 +1182,33 @@ def banner(title: str) -> None:
 
 def run_stratification(aligned: pd.DataFrame, column: str, edges: np.ndarray,
                        variable: str, unit: str, args: argparse.Namespace,
-                       output_path: Path) -> None:
+                       output_path: Path, x_column: str = "map",
+                       y_column: str = "sto2",
+                       meaning: tuple[str, str] | None = None) -> None:
+    x_spec, y_spec = AXES[x_column], AXES[y_column]
+    min_range = (args.min_map_range if x_column == "map"
+                 else args.min_psi_range if x_column == "psi"
+                 else x_spec["min_range"])
+
     bands = []
     for low, high in zip(edges[:-1], edges[1:]):
         # Half-open bins, with the top band closed so the maximum is not lost.
         inside = (aligned[column] >= low) & (
             aligned[column] <= high if high == edges[-1] else aligned[column] < high)
-        frame = aligned.loc[inside]
+        frame = aligned.loc[inside].dropna(subset=[x_column, y_column])
         band = {"label": f"{low:g}-{high:g}", "frame": frame}
         if len(frame):
-            band["pooled"] = pooled_slope(frame)
-            band["within"] = within_patient_slopes(frame, args)
+            band["pooled"] = pooled_slope(frame, x_column, y_column)
+            band["within"] = within_patient_slopes(frame, args, x_column,
+                                                   y_column, min_range)
         bands.append(band)
 
-    banner(f"{variable} bands — slope of StO2 on MAP")
-    print("  Flat (near 0) = the brain holds its oxygen steady while pressure "
-          "moves: autoregulation intact.")
-    print("  Rising        = StO2 follows MAP: the brain is pressure-passive "
-          "and hypotension bites.\n")
+    banner(f"{variable} bands — slope of {y_spec['short']} on {x_spec['short']}")
+    if meaning is None:
+        meaning = (f"{y_spec['short']} is independent of {x_spec['short']}",
+                   f"{y_spec['short']} tracks {x_spec['short']}")
+    print(f"  Near 0   = {meaning[0]}.")
+    print(f"  Non-zero = {meaning[1]}.\n")
     header = (f"  {'band':<12}{'samples':>10}{'pts':>6}{'pooled':>10}"
               f"{'within-patient (95% CI)':>30}{'median r':>10}")
     print(header)
@@ -1190,9 +1279,11 @@ def run_stratification(aligned: pd.DataFrame, column: str, edges: np.ndarray,
         floor = 2.0 / (2.0 ** count) if 0 < count < 12 else 0.0
         if comparison["ci"][0] <= 0.0 <= comparison["ci"][1]:
             print(f"  The interval includes zero, so there is NO evidence here "
-                  f"that {variable} changes the MAP-StO2 relationship. That is "
-                  f"a real answer: it argues against building a model around "
-                  f"this interaction.")
+                  f"that {variable} changes the "
+                  f"{x_spec['short']}-{y_spec['short']} relationship. That is a "
+                  f"real answer: it argues against carrying a "
+                  f"{variable} x {x_spec['short']} interaction term into the "
+                  f"model.")
         elif thin:
             direction = "steeper" if comparison["difference"] > 0 else "flatter"
             print(f"  !! The interval excludes zero (slope {direction} in the "
@@ -1211,14 +1302,17 @@ def run_stratification(aligned: pd.DataFrame, column: str, edges: np.ndarray,
         else:
             direction = "steeper" if comparison["difference"] > 0 else "flatter"
             print(f"  The interval excludes zero: the slope is {direction} in "
-                  f"the {last} band. {variable} DOES modify the MAP-StO2 "
-                  f"relationship, which is the interaction worth modelling.")
+                  f"the {last} band. {variable} DOES modify the "
+                  f"{x_spec['short']}-{y_spec['short']} relationship, so a "
+                  f"{variable} x {x_spec['short']} interaction term earns its "
+                  f"place in the model.")
             if "p" in comparison and comparison["p"] > 0.05:
                 print(f"     Note: the interval and the p-value "
                       f"({comparison['p']:.3g}) disagree. The weaker of the "
                       f"two is the honest reading — call it suggestive.")
 
-    make_stratified_figure(bands, variable, unit, args, output_path)
+    make_stratified_figure(bands, variable, unit, x_column, y_column,
+                           args, output_path)
     print(f"\n  Figure: {output_path}")
 
 
@@ -1286,11 +1380,32 @@ def main() -> int:
         for line in skipped:
             print(f"    {line}")
 
-    # ---- action item 1: PSi bands ------------------------------------------
+    autoreg_meaning = (
+        "StO2 holds steady while MAP moves: autoregulation intact",
+        "StO2 follows MAP: cerebral oxygenation is pressure-passive")
+    coupling_meaning = (
+        "StO2 is independent of depth: no metabolic coupling detected",
+        "StO2 tracks depth; negative is expected, since lower PSi means lower "
+        "CMRO2, lower extraction and so higher venous-weighted StO2")
+
+    # ---- autoregulation: MAP -> StO2, modified by PSi -----------------------
     width = float(args.psi_bin_width)
-    edges = np.arange(0.0, 100.0 + width / 2.0, width)
-    run_stratification(aligned, "psi", edges, "PSi", "",
-                       args, args.outdir / "map_sto2_by_psi.png")
+    psi_edges = np.arange(0.0, 100.0 + width / 2.0, width)
+    run_stratification(aligned, "psi", psi_edges, "PSi", "", args,
+                       args.outdir / "map_sto2_by_psi.png",
+                       x_column="map", y_column="sto2",
+                       meaning=autoreg_meaning)
+
+    # ---- coupling: PSi -> StO2, modified by MAP -----------------------------
+    quantiles = np.linspace(0, 1, max(args.map_bins, 2) + 1)
+    map_edges = np.unique(np.round(aligned["map"].quantile(quantiles).to_numpy(), 1))
+    if len(map_edges) >= 3:
+        banner("MAP bands (quantiles) for the PSi-StO2 coupling")
+        print(f"  Band edges: {', '.join(f'{edge:g}' for edge in map_edges)} mmHg")
+        run_stratification(aligned, "map", map_edges, "MAP", " mmHg", args,
+                           args.outdir / "psi_sto2_by_map.png",
+                           x_column="psi", y_column="sto2",
+                           meaning=coupling_meaning)
 
     # ---- action item 2: cardiac-output bands -------------------------------
     banner("Cardiac output (Hemosphere)")
@@ -1357,15 +1472,33 @@ def main() -> int:
         else:
             print(f"  Band edges (quantiles): "
                   f"{', '.join(f'{edge:g}' for edge in edges)}")
-            run_stratification(usable, "co", edges, "CO", " L/min",
-                               args, args.outdir / "map_sto2_by_co.png")
+            run_stratification(usable, "co", edges, "CO", " L/min", args,
+                               args.outdir / "map_sto2_by_co.png",
+                               x_column="map", y_column="sto2",
+                               meaning=autoreg_meaning)
+            run_stratification(usable, "co", edges, "CO", " L/min", args,
+                               args.outdir / "psi_sto2_by_co.png",
+                               x_column="psi", y_column="sto2",
+                               meaning=coupling_meaning)
 
-    banner("What these figures are for")
-    print("  Flat slopes in every band  -> the brain is protected regardless "
-          "of depth or output; no interaction to model.")
-    print("  Slope steepens as PSi falls -> deep anesthesia weakens "
-          "autoregulation, so deep AND hypotensive is the dangerous "
-          "combination. That is the clinically actionable result.")
+    banner("Reading these four figures")
+    print("  map_sto2_by_psi.png   autoregulation (StO2 on MAP), does depth "
+          "modify it?")
+    print("  map_sto2_by_co.png    autoregulation, does cardiac output modify "
+          "it?")
+    print("  psi_sto2_by_map.png   metabolic coupling (StO2 on PSi), does "
+          "perfusion pressure modify it?")
+    print("  psi_sto2_by_co.png    metabolic coupling, does cardiac output "
+          "modify it?")
+    print("\n  In each: a flat series of within-patient slopes across bands "
+          "means the stratifier does NOT modify the relationship, so that "
+          "interaction term should be left out of the final model. A series "
+          "that trends across bands, with intervals excluding zero, is an "
+          "interaction worth carrying forward.")
+    print("  Expected directions: the autoregulation slope should be near zero "
+          "while autoregulation holds, and the coupling slope should be "
+          "negative, since lower PSi means lower CMRO2, lower oxygen "
+          "extraction and so higher venous-weighted StO2.")
     return 0
 
 
