@@ -192,7 +192,7 @@ SURGERY_DATE_PREFIX = "date of surgery"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    base = Path("/N/project/Analgesia_BDproject/PR/scripts_PR/9-23 Lag Scatter")
+    base = Path("/N/project/Analgesia_BDproject/PR/scripts_PR/10-8 Scatter")
     data = Path("/N/project/Analgesia_BDproject/PR/data")
     parser.add_argument(
         "--filepaths", type=Path, default=data / "sedline_filepaths.csv",
@@ -201,15 +201,14 @@ def parse_args() -> argparse.Namespace:
         "--sto2-filepaths", type=Path, default=data / "sto2_filepaths.csv",
         help="CSV listing one cerebral-StO2 file path per line.")
     parser.add_argument(
-        "--map-filepaths", type=Path, default=None,
-        help="CSV listing one beat-to-beat MAP file path per line. Left "
-             "unset, several usual names are tried inside the data folder; if "
-             "none is found the two MAP figures are skipped and the rest of "
-             "the run is unaffected.")
+        "--map-filepaths", type=Path, default=data / "map_filepaths.csv",
+        help="CSV listing one beat-to-beat MAP file path per line. If it is "
+             "missing the MAP figure is skipped and the rest of the run is "
+             "unaffected.")
     parser.add_argument(
         "--redcap", type=Path,
-        default=data / ("PR_6.16.26.FIXED-TYPOS-BDPostInductionHemod_"
-                        "DATA_LABELS_2026-06-16_1657.csv"),
+        default=Path("/N/project/Analgesia_BDproject/data/00_raw/"
+                     "BDPostInductionHemod_DATA_LABELS_2026-09-30_1420.csv"),
         help="REDCap labeled export holding induction and OR-entry times.")
     parser.add_argument(
         "--outdir", type=Path, default=base / "output",
@@ -1274,14 +1273,14 @@ def main() -> int:
               f"patient's extreme is looked for. Pass --search-minutes 0 to "
               f"search the whole record.")
 
-    map_list = resolve_map_list(args.map_filepaths, args.redcap.parent)
+    map_list = resolve_map_list(args.map_filepaths, args.filepaths.parent)
     if map_list is None:
         banner("Beat-to-beat MAP: not found — the MAP figure will be skipped")
         if args.map_filepaths is not None:
             print(f"  --map-filepaths was given but does not exist: "
                   f"{args.map_filepaths}")
         else:
-            print(f"  Looked in {args.redcap.parent} for: "
+            print(f"  Looked in {args.filepaths.parent} for: "
                   f"{', '.join(MAP_LIST_FALLBACKS)}")
         print("  Pass --map-filepaths <file> to include MAP. Everything else "
               "runs as normal.")

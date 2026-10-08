@@ -46,6 +46,23 @@ TWO SLOPES, AND WHY BOTH ARE REPORTED
   median of the per-patient slopes with an interval obtained by resampling
   patients. Where they disagree, the within-patient number is the one to quote.
 
+DATA SOURCES
+------------
+  --filepaths             Sedline files, for PSi
+  --sto2-filepaths        cerebral oximetry files, for StO2
+  --map-filepaths         beat-to-beat files, for MAP (databad == 1 dropped)
+  --hemosphere-filepaths  Hemosphere files, for cardiac output. Columns are
+                          Timestamp, Date, Time, Technology, CO, CO_SQI. Only
+                          readings whose CO_SQI is at least --min-co-sqi
+                          (default 3) are kept: a low SQI is the monitor saying
+                          it does not trust its own number, and averaging those
+                          in would blur the very bands being compared.
+  --redcap                labeled export, for induction time and OR entry
+
+  PSi, StO2 and MAP are all required of a patient. Cardiac output is optional
+  and merged in only where a Hemosphere file exists, so the PSi analysis keeps
+  its full cohort and only the CO split runs on the smaller subset.
+
 OUTPUT
 ------
   map_sto2_by_psi.png   scatter per PSi band, plus the slope comparison
@@ -56,7 +73,7 @@ USAGE
 -----
     python stratified_autoregulation.py
     python stratified_autoregulation.py --psi-bin-width 20
-    python stratified_autoregulation.py --co-column "Cardiac Output"
+    python stratified_autoregulation.py --min-co-sqi 4
 """
 
 from __future__ import annotations
@@ -110,7 +127,7 @@ BAND_COLORS = ["#2f5597", "#548235", "#c55a11", "#7030a0", "#7f6000", "#495057"]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    base = Path("/N/project/Analgesia_BDproject/PR/scripts_PR/9-23 Lag Scatter")
+    base = Path("/N/project/Analgesia_BDproject/PR/scripts_PR/10-8 Scatter")
     data = Path("/N/project/Analgesia_BDproject/PR/data")
     parser.add_argument("--filepaths", type=Path,
                         default=data / "sedline_filepaths.csv",
@@ -118,14 +135,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sto2-filepaths", type=Path,
                         default=data / "sto2_filepaths.csv",
                         help="CSV listing one cerebral-StO2 file path per line.")
-    parser.add_argument("--map-filepaths", type=Path, default=None,
-                        help="CSV listing one beat-to-beat MAP file per line. "
-                             "Left unset, the usual names are tried in the "
-                             "data folder.")
+    parser.add_argument("--map-filepaths", type=Path,
+                        default=data / "map_filepaths.csv",
+                        help="CSV listing one beat-to-beat MAP file per line.")
+    parser.add_argument("--hemosphere-filepaths", type=Path,
+                        default=data / "hemosphere_filepaths.csv",
+                        help="CSV listing one Hemosphere file per line. These "
+                             "carry cardiac output. If the list is missing, "
+                             "the PSi analysis still runs and only the CO "
+                             "split is skipped.")
     parser.add_argument("--redcap", type=Path,
-                        default=data / ("PR_6.16.26.FIXED-TYPOS-"
-                                        "BDPostInductionHemod_DATA_LABELS_"
-                                        "2026-06-16_1657.csv"),
+                        default=Path("/N/project/Analgesia_BDproject/data/"
+                                     "00_raw/BDPostInductionHemod_DATA_LABELS_"
+                                     "2026-09-30_1420.csv"),
                         help="REDCap labeled export with induction and OR entry.")
     parser.add_argument("--outdir", type=Path, default=base / "output",
                         help="Where the figures are written. No CSVs.")
@@ -147,7 +169,12 @@ def parse_args() -> argparse.Namespace:
                              "0-25, 25-50, 50-75, 75-100).")
     parser.add_argument("--co-column", default=None,
                         help="Exact cardiac-output column name in the "
-                             "beat-to-beat files. Auto-detected if omitted.")
+                             "Hemosphere files. Defaults to 'CO'.")
+    parser.add_argument("--min-co-sqi", type=float, default=3.0,
+                        help="Keep a cardiac-output reading only when its "
+                             "CO_SQI signal-quality index is at least this "
+                             "(default 3). Low-SQI readings are the device "
+                             "saying it does not trust its own number.")
     parser.add_argument("--co-bins", type=int, default=3,
                         help="Number of cardiac-output bands, cut at quantiles "
                              "so each holds a similar number of patients "
@@ -408,29 +435,87 @@ def load_sto2(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
                          "sto2": (total / count).where(count > 0)})
 
 
-def detect_co_column(frame: pd.DataFrame, explicit: str | None) -> str | None:
-    """Find a cardiac-output column, if the beat-to-beat export carries one."""
-    if explicit:
-        for column in frame.columns:
-            if str(column).strip().lower() == explicit.strip().lower():
-                return column
-        return None
-    for prefix in CO_PREFIXES:
-        column = find_column(frame, prefix)
-        if column is not None:
+def find_exact(frame: pd.DataFrame, *names: str) -> str | None:
+    """Match a column by exact name, case- and whitespace-insensitive.
+
+    The Hemosphere export has both 'Timestamp' and 'Time', and a prefix match
+    on "time" picks up 'Timestamp' first -- so these columns must be matched
+    exactly, not by prefix.
+    """
+    wanted = [name.strip().lower() for name in names]
+    for column in frame.columns:
+        if str(column).strip().lower() in wanted:
             return column
     return None
 
 
-def load_map(path: str, induction: pd.Timestamp,
-             co_column: str | None) -> tuple[pd.DataFrame | None, str | None, list]:
-    """Beat-to-beat MAP, plus cardiac output when the file has it."""
+def load_hemosphere(path: str, induction: pd.Timestamp,
+                    co_column: str | None,
+                    min_sqi: float) -> tuple[pd.DataFrame | None, dict]:
+    """Cardiac output from a Hemosphere export, filtered on its own SQI.
+
+    Columns are Timestamp, Date, Time, Technology, CO, CO_SQI. CO_SQI is the
+    monitor's confidence in its own reading, so anything below the threshold is
+    dropped rather than averaged in -- a low-SQI CO is the device telling you
+    not to believe it.
+    """
+    frame = pd.read_csv(path, low_memory=False, skipinitialspace=True)
+    frame.columns = [str(column).strip() for column in frame.columns]
+    info: dict = {"columns": list(frame.columns), "rows": len(frame)}
+
+    value_column = (find_exact(frame, co_column) if co_column
+                    else find_exact(frame, "co", "cardiac output", "co_lmin"))
+    if value_column is None:
+        return None, info
+    info["co_column"] = value_column
+
+    timestamp = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    stamp_column = find_exact(frame, "timestamp")
+    if stamp_column is not None:
+        timestamp = pd.to_datetime(frame[stamp_column].astype("string").str.strip(),
+                                   errors="coerce", format="mixed")
+    date_column, time_column = find_exact(frame, "date"), find_exact(frame, "time")
+    if timestamp.isna().all() and date_column and time_column:
+        timestamp = pd.to_datetime(
+            frame[date_column].astype("string").str.strip() + " "
+            + frame[time_column].astype("string").str.strip(),
+            errors="coerce", format="mixed")
+    if timestamp.isna().all() and time_column:
+        timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
+                                   errors="coerce", format="mixed")
+    if timestamp.isna().all():
+        return None, info
+    timestamp = anchor_clock_only(timestamp, induction)
+
+    value = pd.to_numeric(frame[value_column], errors="coerce")
+    info["co_present"] = int(value.notna().sum())
+
+    sqi_column = find_exact(frame, "co_sqi", "cosqi", "co sqi")
+    if sqi_column is None:
+        info["sqi_column"] = None
+    else:
+        info["sqi_column"] = sqi_column
+        sqi = pd.to_numeric(frame[sqi_column], errors="coerce")
+        kept = sqi >= min_sqi
+        info["co_kept"] = int((value.notna() & kept).sum())
+        # A missing SQI is not evidence of a good reading, so it is dropped too.
+        value = value.where(kept)
+
+    technology = find_exact(frame, "technology")
+    if technology is not None:
+        info["technology"] = sorted(
+            frame[technology].dropna().astype(str).str.strip().unique().tolist())[:6]
+    return pd.DataFrame({"timestamp": timestamp, "co": value}), info
+
+
+def load_map(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
+    """Beat-to-beat MAP, with the monitor's own bad-data rows dropped."""
     frame = pd.read_csv(path, low_memory=False, skipinitialspace=True)
     frame.columns = [str(column).strip() for column in frame.columns]
     value_column = find_column(frame, "meanarterial") or find_column(frame, "map")
-    time_column = find_column(frame, "time")
+    time_column = find_exact(frame, "time") or find_column(frame, "time")
     if value_column is None or time_column is None:
-        return None, None, list(frame.columns)
+        return None
 
     keep = pd.Series(True, index=frame.index)
     bad_column = find_column(frame, "databad")
@@ -440,13 +525,10 @@ def load_map(path: str, induction: pd.Timestamp,
     timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
                                errors="coerce", format="mixed")
     timestamp = anchor_clock_only(timestamp, induction)
-
-    out = pd.DataFrame({"timestamp": timestamp,
-                        "map": pd.to_numeric(frame[value_column], errors="coerce")})
-    found = detect_co_column(frame, co_column)
-    if found is not None:
-        out["co"] = pd.to_numeric(frame[found], errors="coerce")
-    return out.loc[keep], found, list(frame.columns)
+    return pd.DataFrame({
+        "timestamp": timestamp,
+        "map": pd.to_numeric(frame[value_column], errors="coerce"),
+    }).loc[keep]
 
 
 def resolve_map_list(explicit: Path | None, data_dir: Path) -> Path | None:
@@ -489,8 +571,15 @@ def to_grid(frame: pd.DataFrame, column: str, grid: np.ndarray,
 
 
 def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
-                  map_list: Path) -> tuple[pd.DataFrame, str | None, list[str], list]:
-    """One long table: subject_id, minutes, map, sto2, psi and maybe co."""
+                  map_list: Path,
+                  hemo_list: Path | None) -> tuple[pd.DataFrame, dict, list[str]]:
+    """One long table: subject_id, minutes, map, sto2, psi and maybe co.
+
+    PSi, StO2 and MAP are required -- a patient missing any of them cannot
+    contribute to the MAP-StO2 slope at all. Cardiac output is optional and
+    merged in only where a Hemosphere file exists, so the PSi analysis keeps
+    its full cohort and only the CO split runs on the smaller subset.
+    """
     step = float(args.step_seconds) / 60.0
     grid = np.arange(args.min_minutes, args.max_minutes + step / 2.0, step)
     max_gap = float(args.max_gap_seconds) / 60.0
@@ -506,12 +595,14 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
     psi_files = index_by_id(args.filepaths)
     sto2_files = index_by_id(args.sto2_filepaths)
     map_files = index_by_id(map_list)
+    hemo_files = index_by_id(hemo_list) if hemo_list is not None else {}
     shared = sorted(set(psi_files) & set(sto2_files) & set(map_files))
 
     chunks: list[pd.DataFrame] = []
     skipped: list[str] = []
-    co_column_used: str | None = None
-    map_columns_seen: list = []
+    hemo_report: dict = {"listed": len(hemo_files), "matched": 0, "used": 0,
+                         "columns": [], "co_column": None, "sqi_column": None,
+                         "technology": [], "rows_seen": 0, "rows_kept": 0}
 
     for subject_id in shared:
         if subject_id not in events.index:
@@ -525,31 +616,45 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
         try:
             psi_frame = load_sedline(psi_files[subject_id], induction)
             sto2_frame = load_sto2(sto2_files[subject_id], induction)
-            map_frame, co_found, columns = load_map(map_files[subject_id],
-                                                    induction, args.co_column)
+            map_frame = load_map(map_files[subject_id], induction)
         except Exception as exc:
             skipped.append(f"{subject_id}: read error: {exc}")
             continue
-        if not map_columns_seen:
-            map_columns_seen = columns
-        if co_found is not None:
-            co_column_used = co_found
         if psi_frame is None or sto2_frame is None or map_frame is None:
             skipped.append(f"{subject_id}: a signal had no readable values")
             continue
 
+        sources = [(psi_frame, "psi"), (sto2_frame, "sto2"), (map_frame, "map")]
+
+        if subject_id in hemo_files:
+            hemo_report["matched"] += 1
+            try:
+                hemo_frame, info = load_hemosphere(
+                    hemo_files[subject_id], induction, args.co_column,
+                    args.min_co_sqi)
+            except Exception as exc:
+                hemo_frame, info = None, {}
+                skipped.append(f"{subject_id}: Hemosphere read error: {exc}")
+            if info:
+                hemo_report["columns"] = hemo_report["columns"] or info.get("columns", [])
+                hemo_report["co_column"] = hemo_report["co_column"] or info.get("co_column")
+                hemo_report["sqi_column"] = hemo_report["sqi_column"] or info.get("sqi_column")
+                hemo_report["rows_seen"] += info.get("co_present", 0)
+                hemo_report["rows_kept"] += info.get("co_kept", info.get("co_present", 0))
+                for name in info.get("technology", []):
+                    if name not in hemo_report["technology"]:
+                        hemo_report["technology"].append(name)
+            if hemo_frame is not None and hemo_frame["co"].notna().any():
+                hemo_report["used"] += 1
+                sources.append((hemo_frame, "co"))
+
         aligned = {"minutes": grid}
-        for frame, column in ((psi_frame, "psi"), (sto2_frame, "sto2"),
-                              (map_frame, "map")):
+        for frame, column in sources:
             frame = frame.dropna(subset=["timestamp"]).copy()
             frame["minutes"] = (frame["timestamp"] - induction).dt.total_seconds() / 60.0
             low, high = VALID_RANGE[column]
             frame.loc[~frame[column].between(low, high), column] = np.nan
             aligned[column] = to_grid(frame, column, grid, max_gap)
-            if column == "map" and "co" in frame:
-                low, high = VALID_RANGE["co"]
-                frame.loc[~frame["co"].between(low, high), "co"] = np.nan
-                aligned["co"] = to_grid(frame, "co", grid, max_gap)
 
         patient = pd.DataFrame(aligned).dropna(subset=["map", "sto2", "psi"])
         if patient.empty:
@@ -561,7 +666,7 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
     combined = (pd.concat(chunks, ignore_index=True) if chunks
                 else pd.DataFrame(columns=["subject_id", "minutes", "map",
                                            "sto2", "psi"]))
-    return combined, co_column_used, skipped, map_columns_seen
+    return combined, hemo_report, skipped
 
 
 # --------------------------------------------------------------------------- #
@@ -881,13 +986,15 @@ def main() -> int:
         if not path.is_file():
             sys.stderr.write(f"Input file does not exist: {path}\n")
             return 1
-    map_list = resolve_map_list(args.map_filepaths, args.redcap.parent)
+    map_list = resolve_map_list(args.map_filepaths, args.filepaths.parent)
     if map_list is None:
         sys.stderr.write(
             "No beat-to-beat MAP list found. This analysis is built on MAP, so "
             "it cannot run without one.\nPass --map-filepaths <file>. Looked "
-            f"in {args.redcap.parent} for: {', '.join(MAP_LIST_FALLBACKS)}\n")
+            f"in {args.filepaths.parent} for: {', '.join(MAP_LIST_FALLBACKS)}\n")
         return 1
+    hemo_list = (args.hemosphere_filepaths
+                 if args.hemosphere_filepaths.is_file() else None)
 
     events, notes = load_event_times(args.redcap)
     if notes:
@@ -900,7 +1007,7 @@ def main() -> int:
           f"induction, resampled every {args.step_seconds:g} s, never "
           f"interpolating across gaps wider than {args.max_gap_seconds:g} s.")
 
-    aligned, co_column, skipped, map_columns = build_aligned(args, events, map_list)
+    aligned, hemo, skipped = build_aligned(args, events, map_list, hemo_list)
     if aligned.empty:
         sys.stderr.write("\nNo patient had MAP, StO2 and PSi overlapping.\n")
         for line in skipped[:20]:
@@ -931,22 +1038,45 @@ def main() -> int:
                        args, args.outdir / "map_sto2_by_psi.png")
 
     # ---- action item 2: cardiac-output bands -------------------------------
-    banner("Cardiac output")
-    if co_column is None or "co" not in aligned or aligned["co"].notna().sum() == 0:
-        print("  No cardiac-output column was found in the beat-to-beat files, "
-              "so the CO split cannot run.")
-        print("  Columns present in the first MAP file read:")
-        for column in map_columns:
-            print(f"    {column}")
-        print("\n  If one of those is cardiac output, re-run with "
-              "--co-column \"<exact name>\". If CO lives in a different file "
-              "or in REDCap, say which and it can be wired in.")
+    banner("Cardiac output (Hemosphere)")
+    if hemo_list is None:
+        print(f"  No Hemosphere list at {args.hemosphere_filepaths}, so the "
+              f"CO split is skipped. Pass --hemosphere-filepaths <file>.")
+    elif "co" not in aligned or aligned["co"].notna().sum() == 0:
+        print(f"  {hemo['listed']} Hemosphere file(s) listed, "
+              f"{hemo['matched']} matched a patient who also has MAP, StO2 and "
+              f"PSi, but no usable CO came out of them.")
+        if hemo["columns"]:
+            print("  Columns in the first Hemosphere file read:")
+            for column in hemo["columns"]:
+                print(f"    {column}")
+        print(f"\n  CO column found: {hemo['co_column'] or 'NONE'}; "
+              f"SQI column found: {hemo['sqi_column'] or 'NONE'}")
+        print("  If the CO column is named differently, re-run with "
+              "--co-column \"<exact name>\".")
     else:
         usable = aligned.dropna(subset=["co"])
-        print(f"  Using column '{co_column}': "
-              f"{usable['subject_id'].nunique()} patients, "
+        print(f"  {hemo['listed']} Hemosphere file(s) listed; "
+              f"{hemo['matched']} matched a patient with MAP, StO2 and PSi; "
+              f"{hemo['used']} produced usable CO.")
+        print(f"  CO column '{hemo['co_column']}', quality column "
+              f"'{hemo['sqi_column'] or 'NONE'}'")
+        if hemo["sqi_column"] is None:
+            print(f"  !! No CO_SQI column was found, so the "
+                  f"--min-co-sqi {args.min_co_sqi:g} filter could NOT be "
+                  f"applied and every CO reading is being used. Check the "
+                  f"column name before trusting the CO split.")
+        else:
+            dropped = hemo["rows_seen"] - hemo["rows_kept"]
+            share = 100.0 * dropped / hemo["rows_seen"] if hemo["rows_seen"] else 0.0
+            print(f"  SQI filter >= {args.min_co_sqi:g}: kept "
+                  f"{hemo['rows_kept']:,} of {hemo['rows_seen']:,} CO readings "
+                  f"({share:.0f}% dropped as low quality)")
+        if hemo["technology"]:
+            print(f"  Technology values seen: {', '.join(hemo['technology'])}")
+        print(f"  After aligning: {usable['subject_id'].nunique()} patients, "
               f"{len(usable):,} time points")
-        print(f"  CO median {usable['co'].median():.2f} "
+        print(f"  CO median {usable['co'].median():.2f} L/min "
               f"(IQR {usable['co'].quantile(.25):.2f}-"
               f"{usable['co'].quantile(.75):.2f})")
         # Quantile edges so each band holds a comparable amount of data rather
