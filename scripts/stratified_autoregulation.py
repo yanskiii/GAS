@@ -181,6 +181,12 @@ def parse_args() -> argparse.Namespace:
                         help="StO2 channels to average when valid (default "
                              "1,2). A row with only one valid channel uses "
                              "that channel alone.")
+    parser.add_argument("--sto2-fallback-channels", default="3,4",
+                        help="Channels used instead when a patient has no "
+                             "valid reading on the primary pair anywhere in "
+                             "their file (default 3,4). Whole-file, never "
+                             "mixed within a patient. Pass an empty string to "
+                             "disable the fallback.")
     parser.add_argument("--step-seconds", type=float, default=10.0,
                         help="Grid all signals are resampled onto (default 10 s).")
     parser.add_argument("--max-gap-seconds", type=float, default=60.0,
@@ -600,17 +606,17 @@ def load_sedline(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
                          "psi": pd.to_numeric(frame[value_column], errors="coerce")})
 
 
-def load_sto2(path: str, induction: pd.Timestamp,
-              channels: tuple[int, ...] = (1, 2)) -> pd.DataFrame | None:
-    frame, _encoding = read_table(path, ("time", "sto2_ch1", "valid_ch1"))
-    time_column = find_column(frame, "time")
-    if time_column is None:
-        return None
-    timestamp = pd.to_datetime(frame[time_column].astype("string").str.strip(),
-                               errors="coerce", format="mixed")
-    present, total, count = 0, pd.Series(0.0, index=frame.index), pd.Series(0, index=frame.index)
-    # Average the channels flagged valid on each row; a row with only one valid
-    # channel contributes that channel alone rather than being dropped.
+def average_sto2_channels(frame: pd.DataFrame,
+                          channels: tuple[int, ...]) -> tuple[pd.Series, int]:
+    """Mean of the named channels over the rows where each is flagged valid.
+
+    A row with only one valid channel contributes that channel alone rather
+    than being dropped. Returns the series and how many of the named channels
+    were present as columns at all.
+    """
+    present = 0
+    total = pd.Series(0.0, index=frame.index)
+    count = pd.Series(0, index=frame.index)
     for channel in channels:
         value_column = find_column(frame, f"sto2_ch{channel}")
         if value_column is None:
@@ -623,10 +629,36 @@ def load_sto2(path: str, induction: pd.Timestamp,
                                               errors="coerce").eq(1))
         total = total.add(value.fillna(0.0))
         count = count.add(value.notna().astype(int))
-    if present == 0:
-        return None
-    return pd.DataFrame({"timestamp": timestamp,
-                         "sto2": (total / count).where(count > 0)})
+    return (total / count).where(count > 0), present
+
+
+def load_sto2(path: str, induction: pd.Timestamp,
+              channels: tuple[int, ...] = (1, 2),
+              fallback: tuple[int, ...] = (3, 4)
+              ) -> tuple[pd.DataFrame | None, tuple[int, ...] | None]:
+    """Cerebral StO2, falling back to the second probe pair when the first is dead.
+
+    Some patients have no valid reading on CH1 or CH2 anywhere in the record --
+    the sensors were on CH3 and CH4 instead. The fallback is whole-file, not
+    per-row: mixing probe pairs within one patient would splice together two
+    different anatomical sites and any apparent change could be the switch
+    rather than the patient. Returns the frame and which pair was used.
+    """
+    frame, _encoding = read_table(path, ("time", "sto2_ch1", "valid_ch1"))
+    time_column = find_exact(frame, "time") or find_column(frame, "time")
+    if time_column is None:
+        return None, None
+    timestamp = as_datetime(frame[time_column])
+
+    values, present = average_sto2_channels(frame, channels)
+    used = channels
+    if present == 0 or values.notna().sum() == 0:
+        alternative, alternative_present = average_sto2_channels(frame, fallback)
+        if alternative_present and alternative.notna().sum() > 0:
+            values, used = alternative, fallback
+        elif present == 0:
+            return None, None
+    return pd.DataFrame({"timestamp": timestamp, "sto2": values}), used
 
 
 def find_exact(frame: pd.DataFrame, *names: str) -> str | None:
@@ -773,6 +805,10 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
     max_gap = float(args.max_gap_seconds) / 60.0
     channels = tuple(int(part) for part in str(args.sto2_channels).split(",")
                      if part.strip())
+    fallback = tuple(int(part) for part
+                     in str(args.sto2_fallback_channels).split(",")
+                     if part.strip())
+    sto2_fallback_used: list[str] = []
 
     def index_by_id(filepaths: Path) -> dict[str, str]:
         found: dict[str, str] = {}
@@ -806,7 +842,12 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
 
         try:
             psi_frame = load_sedline(psi_files[subject_id], induction)
-            sto2_frame = load_sto2(sto2_files[subject_id], induction, channels)
+            sto2_frame, sto2_used = load_sto2(sto2_files[subject_id],
+                                              induction, channels, fallback)
+            if sto2_used is not None and tuple(sto2_used) != channels:
+                sto2_fallback_used.append(
+                    f"{subject_id} (channels "
+                    f"{','.join(str(c) for c in sto2_used)})")
             map_frame = load_map(map_files[subject_id], induction)
         except Exception as exc:
             skipped.append(f"{subject_id}: read error: {exc}")
@@ -903,6 +944,7 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
     combined = (pd.concat(chunks, ignore_index=True) if chunks
                 else pd.DataFrame(columns=["subject_id", "minutes", "map",
                                            "sto2", "psi"]))
+    hemo_report["sto2_fallback"] = sto2_fallback_used
     return combined, hemo_report, skipped
 
 
@@ -1354,7 +1396,10 @@ def main() -> int:
           f"across gaps wider than {args.max_gap_seconds:g} s.")
     print(f"  Kept: CO where CO_SQI >= {args.min_co_sqi:g}; MAP where "
           f"databad == 0; PSi where the value is not '-'; StO2 averaged over "
-          f"channels {args.sto2_channels} flagged valid.")
+          f"channels {args.sto2_channels} flagged valid"
+          + (f", falling back to {args.sto2_fallback_channels} for a patient "
+             f"with no valid reading on the primary pair."
+             if args.sto2_fallback_channels.strip() else "."))
 
     aligned, hemo, skipped = build_aligned(args, events, map_list, hemo_list)
     if aligned.empty:
@@ -1375,6 +1420,12 @@ def main() -> int:
           f"(IQR {aligned['sto2'].quantile(.25):.0f}-{aligned['sto2'].quantile(.75):.0f})")
     print(f"  PSi  median {aligned['psi'].median():.0f} "
           f"(IQR {aligned['psi'].quantile(.25):.0f}-{aligned['psi'].quantile(.75):.0f})")
+    if hemo.get("sto2_fallback"):
+        print(f"\n  {len(hemo['sto2_fallback'])} patient(s) had no valid "
+              f"StO2 on channels {args.sto2_channels} anywhere in their file "
+              f"and used the fallback pair instead:")
+        for line in hemo["sto2_fallback"]:
+            print(f"    {line}")
     if skipped:
         print(f"\n  {len(skipped)} patient(s) could not be aligned:")
         for line in skipped:
