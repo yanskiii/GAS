@@ -201,6 +201,43 @@ def parse_args() -> argparse.Namespace:
 # this file can be copied to the cluster on its own)
 # --------------------------------------------------------------------------- #
 
+def read_table(path: str) -> tuple[pd.DataFrame, str]:
+    """Read a monitor CSV whatever encoding it was written in.
+
+    Monitor exports are not reliably UTF-8: the Hemosphere files are written by
+    a Windows device and fail to decode as UTF-8 part-way through the first
+    line. The byte-order mark settles UTF-16 and UTF-8-with-BOM outright;
+    otherwise UTF-8 is tried first so nothing changes for files that were
+    already fine, then cp1252, then latin-1, which cannot fail to decode. Only
+    numbers and timestamps are read from these files, so a mangled character in
+    a text column costs nothing.
+
+    A file that comes back as a single column was split on the wrong character,
+    so the separator is sniffed on a second pass.
+    """
+    with open(path, "rb") as handle:
+        signature = handle.read(4)
+    if signature[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        encodings = ["utf-16", "utf-16-le", "utf-16-be"]
+    elif signature[:3] == b"\xef\xbb\xbf":
+        encodings = ["utf-8-sig"]
+    else:
+        encodings = ["utf-8", "cp1252", "latin-1"]
+
+    failure: Exception | None = None
+    for encoding in encodings:
+        try:
+            frame = pd.read_csv(path, low_memory=False, skipinitialspace=True,
+                                encoding=encoding)
+            if frame.shape[1] <= 1:
+                frame = pd.read_csv(path, sep=None, engine="python",
+                                    skipinitialspace=True, encoding=encoding)
+            return frame, encoding
+        except Exception as exc:
+            failure = exc
+    raise failure if failure else RuntimeError(f"could not read {path}")
+
+
 def read_filepath_list(master: Path) -> list[str]:
     paths: list[str] = []
     with open(master, "r", newline="") as handle:
@@ -384,7 +421,7 @@ def anchor_clock_only(timestamp: pd.Series, induction: pd.Timestamp) -> pd.Serie
 
 
 def load_sedline(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
-    frame = pd.read_csv(path, low_memory=False)
+    frame, _encoding = read_table(path)
     value_column = find_column(frame, "psi")
     date_column = find_column(frame, "date")
     time_column = find_column(frame, "time")
@@ -410,7 +447,7 @@ def load_sedline(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
 
 
 def load_sto2(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
-    frame = pd.read_csv(path, low_memory=False)
+    frame, _encoding = read_table(path)
     time_column = find_column(frame, "time")
     if time_column is None:
         return None
@@ -459,9 +496,10 @@ def load_hemosphere(path: str, induction: pd.Timestamp,
     dropped rather than averaged in -- a low-SQI CO is the device telling you
     not to believe it.
     """
-    frame = pd.read_csv(path, low_memory=False, skipinitialspace=True)
+    frame, encoding = read_table(path)
     frame.columns = [str(column).strip() for column in frame.columns]
-    info: dict = {"columns": list(frame.columns), "rows": len(frame)}
+    info: dict = {"columns": list(frame.columns), "rows": len(frame),
+                  "encoding": encoding}
 
     value_column = (find_exact(frame, co_column) if co_column
                     else find_exact(frame, "co", "cardiac output", "co_lmin"))
@@ -510,7 +548,7 @@ def load_hemosphere(path: str, induction: pd.Timestamp,
 
 def load_map(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
     """Beat-to-beat MAP, with the monitor's own bad-data rows dropped."""
-    frame = pd.read_csv(path, low_memory=False, skipinitialspace=True)
+    frame, _encoding = read_table(path)
     frame.columns = [str(column).strip() for column in frame.columns]
     value_column = find_column(frame, "meanarterial") or find_column(frame, "map")
     time_column = find_exact(frame, "time") or find_column(frame, "time")
@@ -602,7 +640,8 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
     skipped: list[str] = []
     hemo_report: dict = {"listed": len(hemo_files), "matched": 0, "used": 0,
                          "columns": [], "co_column": None, "sqi_column": None,
-                         "technology": [], "rows_seen": 0, "rows_kept": 0}
+                         "technology": [], "rows_seen": 0, "rows_kept": 0,
+                         "errors": [], "encodings": [], "no_co": []}
 
     for subject_id in shared:
         if subject_id not in events.index:
@@ -634,8 +673,14 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
                     args.min_co_sqi)
             except Exception as exc:
                 hemo_frame, info = None, {}
-                skipped.append(f"{subject_id}: Hemosphere read error: {exc}")
+                # A Hemosphere failure costs this patient their CO only; they
+                # still have MAP, StO2 and PSi, so it must not be filed as an
+                # alignment failure or the report contradicts itself.
+                hemo_report["errors"].append(f"{subject_id}: {exc}")
             if info:
+                encoding = info.get("encoding")
+                if encoding and encoding not in hemo_report["encodings"]:
+                    hemo_report["encodings"].append(encoding)
                 hemo_report["columns"] = hemo_report["columns"] or info.get("columns", [])
                 hemo_report["co_column"] = hemo_report["co_column"] or info.get("co_column")
                 hemo_report["sqi_column"] = hemo_report["sqi_column"] or info.get("sqi_column")
@@ -647,6 +692,8 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
             if hemo_frame is not None and hemo_frame["co"].notna().any():
                 hemo_report["used"] += 1
                 sources.append((hemo_frame, "co"))
+            elif hemo_frame is not None:
+                hemo_report["no_co"].append(subject_id)
 
         aligned = {"minutes": grid}
         for frame, column in sources:
@@ -963,16 +1010,43 @@ def run_stratification(aligned: pd.DataFrame, column: str, edges: np.ndarray,
               f"{comparison['ci'][1]:+.4f})"
               + (f", {'Wilcoxon' if comparison['design'] == 'paired' else 'Mann-Whitney'}"
                  f" p={comparison['p']:.3g}" if "p" in comparison else ""))
+        count = comparison.get("n", min(comparison.get("n_a", 0),
+                                        comparison.get("n_b", 0)))
+        thin = count < 10
+        # A signed-rank test on n patients cannot return a p below 2/2**n, so
+        # at n=5 the smallest achievable p is 0.0625 and significance is out of
+        # reach no matter how large the effect. Saying "DOES modify" off such a
+        # comparison would be claiming more than the data can carry.
+        floor = 2.0 / (2.0 ** count) if 0 < count < 12 else 0.0
         if comparison["ci"][0] <= 0.0 <= comparison["ci"][1]:
             print(f"  The interval includes zero, so there is NO evidence here "
                   f"that {variable} changes the MAP-StO2 relationship. That is "
                   f"a real answer: it argues against building a model around "
                   f"this interaction.")
+        elif thin:
+            direction = "steeper" if comparison["difference"] > 0 else "flatter"
+            print(f"  !! The interval excludes zero (slope {direction} in the "
+                  f"{last} band), but this rests on only {count} patient(s) and "
+                  f"is NOT reliable.")
+            if floor and "p" in comparison:
+                print(f"     With {count} patients the smallest p the test can "
+                      f"return is {floor:.4f}, so it could never reach 0.05 "
+                      f"however large the effect. The reported p="
+                      f"{comparison['p']:.3g} is at or near that floor.")
+            print(f"     Treat this as a hint to chase, not a finding. The "
+                  f"usual cause is that few patients spend enough time in BOTH "
+                  f"bands; widening --min-minutes to take in more "
+                  f"pre-induction record is what adds patients to the light "
+                  f"band.")
         else:
             direction = "steeper" if comparison["difference"] > 0 else "flatter"
             print(f"  The interval excludes zero: the slope is {direction} in "
                   f"the {last} band. {variable} DOES modify the MAP-StO2 "
                   f"relationship, which is the interaction worth modelling.")
+            if "p" in comparison and comparison["p"] > 0.05:
+                print(f"     Note: the interval and the p-value "
+                      f"({comparison['p']:.3g}) disagree. The weaker of the "
+                      f"two is the honest reading — call it suggestive.")
 
     make_stratified_figure(bands, variable, unit, args, output_path)
     print(f"\n  Figure: {output_path}")
@@ -1046,8 +1120,13 @@ def main() -> int:
         print(f"  {hemo['listed']} Hemosphere file(s) listed, "
               f"{hemo['matched']} matched a patient who also has MAP, StO2 and "
               f"PSi, but no usable CO came out of them.")
+        if hemo["errors"]:
+            print(f"\n  {len(hemo['errors'])} file(s) could not be read at all. "
+                  f"First few:")
+            for line in hemo["errors"][:5]:
+                print(f"    {line}")
         if hemo["columns"]:
-            print("  Columns in the first Hemosphere file read:")
+            print("\n  Columns in the first Hemosphere file read:")
             for column in hemo["columns"]:
                 print(f"    {column}")
         print(f"\n  CO column found: {hemo['co_column'] or 'NONE'}; "
@@ -1060,7 +1139,15 @@ def main() -> int:
               f"{hemo['matched']} matched a patient with MAP, StO2 and PSi; "
               f"{hemo['used']} produced usable CO.")
         print(f"  CO column '{hemo['co_column']}', quality column "
-              f"'{hemo['sqi_column'] or 'NONE'}'")
+              f"'{hemo['sqi_column'] or 'NONE'}', "
+              f"encoding {', '.join(hemo['encodings']) or 'unknown'}")
+        if hemo["errors"]:
+            print(f"  {len(hemo['errors'])} file(s) could not be read; first: "
+                  f"{hemo['errors'][0]}")
+        if hemo["no_co"]:
+            print(f"  {len(hemo['no_co'])} file(s) read but held no CO passing "
+                  f"the quality filter: {', '.join(hemo['no_co'][:8])}"
+                  + (" ..." if len(hemo["no_co"]) > 8 else ""))
         if hemo["sqi_column"] is None:
             print(f"  !! No CO_SQI column was found, so the "
                   f"--min-co-sqi {args.min_co_sqi:g} filter could NOT be "
