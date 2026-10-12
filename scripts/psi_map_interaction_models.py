@@ -46,23 +46,58 @@ THE ESTIMAND, AND WHY A RANDOM INTERCEPT IS NOT ENOUGH
 
 READING THE INTERACTION
 -----------------------
-  With MAP and PSi each centered at a reported constant, the model is
+  Writing the model with raw MAP times raw PSi hides two different
+  interactions in one coefficient, so each variable enters as a deviation from
+  that patient's own mean and the product is split:
 
-      cerebral O2 = b_map*MAP_c + b_psi*PSi_c + d*(MAP_c x PSi_c) + patient + e
+      cerebral O2 = b*MAP_w + c*PSi_w + d*(MAP_w x PSi_w)
+                            + e*(MAP_w x mean PSi) + patient + error
 
-  and the within-patient MAP slope at an absolute PSi of p is
+  d is the clinical quantity: when THIS patient goes deeper than their own
+  average, does THIS patient's MAP-cerebral O2 slope change? e is the
+  cross-level term -- do patients who are deeper ON AVERAGE have different
+  slopes -- and it is reported beside d rather than averaged into it. Forcing
+  the two to share a coefficient drags the estimate toward whichever is
+  weaker, which on fixtures with a planted interaction cost two thirds of it.
 
-      slope(p) = b_map + d*(p - PSi_center)
+  The within-patient MAP slope at an absolute PSi of p, for a patient of
+  average depth, is then
 
-  which is what makes "the MAP slope at PSi 30 versus at PSi 50" a contrast of
-  model coefficients rather than two separate subgroup fits. Every number in
-  the report is such a contrast, with its interval from the same covariance
-  matrix, so the pieces are guaranteed to be mutually consistent.
+      slope(p) = b + d*(p - PSi_reference)
+
+  which makes "the MAP slope at PSi 30 versus at PSi 50" a contrast of model
+  coefficients rather than two separate subgroup fits. Every number in the
+  report is such a contrast, taken against the same covariance matrix, so the
+  tables and the figures cannot drift apart.
 
   Expected directions. The MAP slope should sit near zero while autoregulation
   holds and climb positive once cerebral oxygenation turns pressure-passive. A
   NEGATIVE d means the slope becomes more positive as PSi falls, i.e. deeper
   anesthesia is associated with a more pressure-passive brain.
+
+WHAT ELSE IS READ, AND WHY
+--------------------------
+  Medications (--medications). The propofol infusion rate IS the anesthetic
+  concentration the outline asks to adjust for, at least in a TIVA case, and
+  unlike age or ASA it varies within a patient, so the fixed effects do not
+  absorb it. The bolus times matter more: propofol lowers MAP and PSi at the
+  same instant, so "deep and hypotensive" can be pharmacology rather than
+  physiology. That is the main rival explanation for the headline result, and
+  the sensitivity section tests it by refitting with the minutes around every
+  bolus removed.
+
+  Hemosphere extras (--hemosphere-extra). SVV, PPV and HPI are genuinely new
+  signals and their coverage is reported. SVR, SVRI, CI and SVI are NOT: SVR
+  is exactly 80 x (MAP - CVP) / CO, verified to the last digit against the
+  export, so beside MAP and CO it is a transform of what the model already
+  holds, and CVP arrives as a manually entered constant. They are read so
+  their availability is visible, and flagged so that nobody adjusts for them
+  by accident.
+
+  REDCap (--redcap). Induction and OR-entry times, and the Table 1 baseline
+  characteristics. Those characteristics are patient-level, so the fixed
+  effects absorb every one of them: they describe the cohort, they do not
+  adjust the models, and adding them would move no estimate.
 
 OUTPUT
 ------
@@ -198,7 +233,60 @@ COVARIATE_PATTERNS = {
 }
 COVARIATE_LABELS = {"etco2": "end-tidal CO2 (mmHg)",
                     "fio2": "inspired O2 fraction (%)",
-                    "agent": "anesthetic concentration (MAC or % agent)"}
+                    "agent": "anesthetic concentration (MAC or % agent)",
+                    "propofol_rate": "propofol infusion rate (mcg/kg/min)",
+                    "pressor_rate": "vasopressor infusion rate (mcg/min)"}
+
+# Extra Hemosphere channels. Each is read where the file carries it, so that
+# coverage can be REPORTED across the cohort even where the channel is not
+# modelled; `derived` marks a column that is an algebraic function of signals
+# the model already has, and so carries no independent information.
+HEMOSPHERE_EXTRA: dict[str, dict] = {
+    "svv": {"column": "SVV", "range": (0.0, 60.0), "label": "SVV (%)",
+            "derived": False},
+    "ppv": {"column": "PPV", "range": (0.0, 60.0), "label": "PPV (%)",
+            "derived": False},
+    "hpi": {"column": "HPI", "range": (0.0, 100.0),
+            "label": "Hypotension Prediction Index", "derived": False},
+    "pr": {"column": "PR", "range": (20.0, 200.0), "label": "pulse rate (bpm)",
+           "derived": False},
+    "svr": {"column": "SVR", "range": (100.0, 6000.0),
+            "label": "SVR (dyne-s/cm5)",
+            "derived": "SVR is exactly 80 x (MAP - CVP) / CO -- verified to "
+                       "the last digit against this export -- so beside MAP "
+                       "and CO it is a transform of what the model already "
+                       "has, not a new measurement"},
+    "cvp": {"column": "CVP", "range": (-5.0, 40.0), "label": "CVP (mmHg)",
+            "derived": "CVP_Source reads 'Manual Entry' and the value is held "
+                       "constant through the case, so it is an assumed number "
+                       "rather than a measured signal"},
+    "hemo_map": {"column": "MAP", "range": (20.0, 160.0),
+                 "label": "MAP from Hemosphere (mmHg)",
+                 "derived": "a second, 20-second-interval copy of a pressure "
+                            "the beat-to-beat file already supplies densely; "
+                            "useful only as a cross-check"},
+}
+VALID_RANGE.update({name: spec["range"] for name, spec in HEMOSPHERE_EXTRA.items()})
+
+# Drug classes, matched against drug_key first and the printed drug name
+# second. Only the classes that bear on this analysis are named: what moves
+# blood pressure, and what moves anesthetic depth.
+DRUG_CLASSES: dict[str, tuple[str, ...]] = {
+    "hypnotic": ("prop", "propofol", "ketamine", "ketam", "midazolam", "versed",
+                 "midaz", "etomidate", "etom", "dexmedetomidine", "precedex",
+                 "dexmed"),
+    "vasoactive": ("phenyl", "phenylephrine", "ephedrine", "ephed",
+                   "norepinephrine", "norepi", "levophed", "epinephrine",
+                   "epinep", "vasopressin", "vaso", "nicardipine", "nicard",
+                   "esmolol", "hydralazine", "hydral", "labetalol", "labet",
+                   "nitroglycerin", "ntg", "dobutamine", "dopamine",
+                   "angiotensin", "giapreza"),
+    "opioid": ("fent", "fentanyl", "remifentanil", "remi", "sufentanil",
+               "hydromorphone", "dilaudid", "morphine", "methadone"),
+    "neuromuscular": ("rocuronium", "roc", "succinylcholine", "succ",
+                      "vecuronium", "vec", "cisatracurium", "cisat",
+                      "sugammadex", "neostigmine"),
+}
 
 AXES = {
     "map": {"label": "MAP (mmHg)", "short": "MAP", "unit": "mmHg",
@@ -242,11 +330,22 @@ def parse_args() -> argparse.Namespace:
                             "it the models are UNADJUSTED and the report says "
                             "so; the adjustment the outline asks for cannot be "
                             "invented from the monitors already loaded.")
+    group.add_argument("--medications", type=Path,
+                       default=Path("/N/project/Analgesia_BDproject/data/"
+                                    "processed/medication_events.csv"),
+                       help="Medication events given in the OR, one row per "
+                            "bolus or infusion step. Supplies the propofol "
+                            "infusion rate (the anesthetic exposure the "
+                            "outline asks to adjust for, and one that varies "
+                            "within a patient) and the timing needed to test "
+                            "whether the interaction is pharmacology rather "
+                            "than physiology. Skipped if the file is absent.")
     group.add_argument("--redcap", type=Path,
                        default=Path("/N/project/Analgesia_BDproject/data/"
                                     "00_raw/BDPostInductionHemod_DATA_LABELS_"
                                     "2026-09-30_1420.csv"),
-                       help="REDCap labeled export, for induction and OR entry.")
+                       help="REDCap labeled export, for induction, OR entry "
+                            "and the Table 1 baseline characteristics.")
     group.add_argument("--outdir", type=Path, default=base / "output",
                        help="Where the figures and table images are written.")
 
@@ -276,6 +375,21 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--min-co-sqi", type=float, default=3.0,
                        help="Keep a CO reading only when CO_SQI is at least "
                             "this (default 3).")
+    group.add_argument("--hemosphere-extra", default="svv,ppv,hpi,pr,svr,cvp",
+                       help="Further Hemosphere channels to read and report "
+                            "coverage for (default svv,ppv,hpi,pr,svr,cvp). "
+                            "SVR and CVP are read so their availability is "
+                            "visible, and flagged in the report as derived or "
+                            "assumed rather than measured.")
+    group.add_argument("--drug-window-minutes", type=float, default=5.0,
+                       help="How long after a bolus a time point counts as "
+                            "drug-disturbed (default 5 min).")
+    group.add_argument("--propofol-key", default="prop",
+                       help="drug_key prefix for the hypnotic infusion whose "
+                            "rate is used as the anesthetic exposure.")
+    group.add_argument("--pressor-key", default="phenyl",
+                       help="drug_key prefix for the vasopressor infusion "
+                            "whose rate is carried as a covariate.")
 
     group = parser.add_argument_group("model")
     group.add_argument("--representative-psi", default="30,50",
@@ -801,9 +915,16 @@ def load_sto2(path: str, induction: pd.Timestamp,
 
 
 def load_hemosphere(path: str, induction: pd.Timestamp,
-                    co_column: str | None,
-                    min_sqi: float) -> tuple[pd.DataFrame | None, dict]:
-    """Cardiac output from a Hemosphere export, filtered on its own SQI."""
+                    co_column: str | None, min_sqi: float,
+                    extra: tuple[str, ...] = ()
+                    ) -> tuple[pd.DataFrame | None, dict]:
+    """Cardiac output from a Hemosphere export, filtered on its own SQI.
+
+    `extra` names further channels to carry along (SVV, PPV, HPI and the rest).
+    They are read where present so their coverage can be reported honestly
+    across the cohort -- several of the parameters this device lists are blank
+    unless the matching module was attached.
+    """
     frame, encoding = read_table(
         path, ("timestamp", "date", "time", "technology", "co", "co_sqi"))
     frame.columns = [str(column).strip() for column in frame.columns]
@@ -847,7 +968,21 @@ def load_hemosphere(path: str, induction: pd.Timestamp,
     if technology is not None:
         info["technology"] = sorted(
             frame[technology].dropna().astype(str).str.strip().unique().tolist())[:6]
-    return pd.DataFrame({"timestamp": timestamp, "co": value}), info
+
+    out = {"timestamp": timestamp, "co": value}
+    info["extra_present"] = {}
+    for name in extra:
+        spec = HEMOSPHERE_EXTRA.get(name)
+        if spec is None:
+            continue
+        column = find_exact(frame, spec["column"])
+        if column is None:
+            continue
+        channel = pd.to_numeric(frame[column], errors="coerce")
+        info["extra_present"][name] = int(channel.notna().sum())
+        if channel.notna().any():
+            out[name] = channel
+    return pd.DataFrame(out), info
 
 
 def load_map(path: str, induction: pd.Timestamp) -> pd.DataFrame | None:
@@ -929,6 +1064,197 @@ def load_covariates(path: str, induction: pd.Timestamp
     return pd.DataFrame(out), info
 
 
+def classify_drug(drug: object, drug_key: object) -> str | None:
+    """Which class a medication belongs to, by key first and printed name second."""
+    key = normalize(drug_key).replace(" ", "")
+    name = normalize(drug)
+    for label, tokens in DRUG_CLASSES.items():
+        for token in tokens:
+            if key == token or name == token:
+                return label
+    for label, tokens in DRUG_CLASSES.items():
+        for token in tokens:
+            if name.startswith(token) or key.startswith(token):
+                return label
+    return None
+
+
+def excel_flag(values: pd.Series) -> pd.Series:
+    """Read a 0/1 column that Excel has reformatted into dates.
+
+    In this export `event_valid` arrives as a mixture of 1 and
+    '1900-01-01 00:00:00' -- the same value, one of them having been formatted
+    as a date, where day 1 of the 1900 epoch IS the number 1. Reading it
+    naively marks valid rows invalid, so both spellings are mapped back.
+    """
+    text = values.astype("string").str.strip()
+    out = pd.to_numeric(text, errors="coerce")
+    stamps = pd.to_datetime(text.where(out.isna()), errors="coerce",
+                            format="mixed")
+    # Excel renders serial 1 as 1900-01-01 and 2 as 1900-01-02, so the day
+    # count runs from 1899-12-31. (The more familiar 1899-12-30 epoch is the
+    # one that corrects for Excel's phantom 1900 leap day; here the displayed
+    # dates are what has to be inverted, not the corrected ones.)
+    recovered = (stamps - pd.Timestamp("1899-12-31")).dt.days
+    return out.fillna(recovered)
+
+
+def load_medications(path: Path) -> tuple[pd.DataFrame, dict]:
+    """Every medication event in the OR, as one tidy table of time intervals.
+
+    A bolus becomes an instant; an infusion becomes a start-stop interval
+    carrying its rate. What this buys the analysis is two things the monitors
+    cannot say on their own:
+
+      * the anesthetic concentration the outline asks to adjust for -- for a
+        TIVA case the propofol infusion rate IS that exposure, and unlike age
+        or ASA it varies within a patient, so patient fixed effects do not
+        absorb it;
+      * the single biggest threat to the headline result. Propofol lowers MAP
+        and PSi at the same moment, so "deep and hypotensive" can co-occur for
+        a pharmacological reason rather than a physiological one. Knowing when
+        the drugs moved lets that explanation be tested instead of assumed.
+    """
+    frame, encoding = read_table(str(path), ("subject_id", "drug", "drug_key",
+                                             "administration_type",
+                                             "bolus_time", "infusion_start"))
+    frame.columns = [str(column).strip() for column in frame.columns]
+    info: dict = {"encoding": encoding, "rows": len(frame), "columns":
+                  list(frame.columns), "dropped": {}, "classes": {}, "drugs": {}}
+
+    subject = find_exact(frame, "subject_id") or find_column(frame, "subject")
+    if subject is None:
+        raise ValueError("the medication export has no subject_id column")
+    ids = frame[subject].astype("string").str.strip().str.upper()
+    # The export carries a trailing summary row whose fields are shifted by one
+    # -- its subject_id is a timestamp. Requiring a real research ID drops it
+    # without having to guess at how many such rows there are.
+    real = ids.str.fullmatch(r"IU(?:MH|UH)\d+", na=False)
+    info["dropped"]["not a research ID"] = int((~real).sum())
+    frame, ids = frame.loc[real].copy(), ids.loc[real]
+
+    valid_column = find_exact(frame, "event_valid")
+    if valid_column is not None:
+        valid = excel_flag(frame[valid_column])
+        info["dropped"]["event_valid != 1"] = int((valid.ne(1) & valid.notna()).sum())
+        frame = frame.loc[valid.ne(0) | valid.isna()]
+    duplicate_column = find_exact(frame, "possible_duplicate_event")
+    if duplicate_column is not None:
+        duplicate = excel_flag(frame[duplicate_column]).fillna(0)
+        info["dropped"]["flagged duplicate"] = int(duplicate.eq(1).sum())
+        frame = frame.loc[duplicate.ne(1)]
+
+    drug_column = find_exact(frame, "drug")
+    key_column = find_exact(frame, "drug_key")
+    kind_column = find_exact(frame, "administration_type")
+    dose_column = find_exact(frame, "dose_or_rate") or find_exact(frame, "dose_or_rate_raw")
+    unit_column = find_exact(frame, "unit")
+    bolus_column = find_exact(frame, "bolus_time") or find_exact(frame, "bolus_time_raw")
+    start_column = find_exact(frame, "infusion_start") or find_exact(frame, "infusion_start_raw")
+    stop_column = find_exact(frame, "infusion_stop") or find_exact(frame, "infusion_stop_raw")
+
+    kind = (frame[kind_column].astype("string").str.strip().str.lower()
+            if kind_column else pd.Series("bolus", index=frame.index))
+    start = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    stop = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    if bolus_column is not None:
+        start = start.fillna(as_datetime(frame[bolus_column]))
+    if start_column is not None:
+        start = start.fillna(as_datetime(frame[start_column]))
+    if stop_column is not None:
+        stop = as_datetime(frame[stop_column])
+
+    classes = [classify_drug(drug, key) for drug, key
+               in zip(frame[drug_column] if drug_column else [None] * len(frame),
+                      frame[key_column] if key_column else [None] * len(frame))]
+    events = pd.DataFrame({
+        "subject_id": frame[subject].astype("string").str.strip().str.upper(),
+        "drug": (frame[drug_column].astype("string").str.strip()
+                 if drug_column else pd.Series("", index=frame.index)),
+        "drug_key": (normalize_series(frame[key_column]) if key_column
+                     else pd.Series("", index=frame.index)),
+        "drug_class": classes,
+        "kind": kind,
+        "dose": (pd.to_numeric(frame[dose_column], errors="coerce")
+                 if dose_column else np.nan),
+        "unit": (frame[unit_column].astype("string").str.strip().str.lower()
+                 if unit_column else pd.Series("", index=frame.index)),
+        "start": start, "stop": stop})
+    events = events.loc[events["start"].notna()]
+    # An infusion with no recorded stop is left open rather than discarded; it
+    # is closed at the end of that patient's record when the grid is built.
+    events.loc[events["kind"].eq("infusion") & events["stop"].isna(), "stop"] = pd.NaT
+
+    info["kept"] = len(events)
+    info["patients"] = int(events["subject_id"].nunique())
+    info["classes"] = events["drug_class"].fillna("unclassified").value_counts().to_dict()
+    info["drugs"] = events["drug"].value_counts().head(25).to_dict()
+    info["unclassified"] = sorted(
+        events.loc[events["drug_class"].isna(), "drug"].dropna().unique().tolist())[:12]
+    return events, info
+
+
+def normalize_series(values: pd.Series) -> pd.Series:
+    return values.astype("string").str.strip().str.lower()
+
+
+def medication_features(events: pd.DataFrame, grid: np.ndarray,
+                        induction: pd.Timestamp, window_minutes: float,
+                        propofol_key: str, pressor_key: str) -> dict[str, np.ndarray]:
+    """Turn one patient's medication events into signals on their own grid.
+
+    Four features, each chosen because it answers a question the reviewer will
+    ask rather than because it was easy to compute:
+
+      propofol_rate   the running infusion rate, as the anesthetic exposure
+      pressor_rate    the running vasopressor infusion rate
+      bolus_hypnotic  1 while within `window` minutes AFTER a hypnotic bolus
+      bolus_vasoactive  the same for anything given to move blood pressure
+
+    The two indicators mark the stretches where MAP and PSi were being pushed
+    by a syringe. Dropping those stretches is the cleanest test of whether the
+    interaction is physiology or pharmacology.
+    """
+    minutes = (events["start"] - induction).dt.total_seconds() / 60.0
+    stop_minutes = (events["stop"] - induction).dt.total_seconds() / 60.0
+    end = float(grid[-1]) if len(grid) else 0.0
+
+    def infusion_rate(mask: pd.Series) -> np.ndarray:
+        rate = np.zeros_like(grid, dtype=float)
+        rows = events.loc[mask & events["kind"].eq("infusion")]
+        for index in rows.index:
+            begin = minutes.get(index, np.nan)
+            finish = stop_minutes.get(index, np.nan)
+            dose = rows.at[index, "dose"]
+            if not np.isfinite(begin) or not np.isfinite(dose):
+                continue
+            if not np.isfinite(finish):
+                finish = end
+            rate[(grid >= begin) & (grid <= finish)] += float(dose)
+        return rate
+
+    def bolus_window(mask: pd.Series) -> np.ndarray:
+        flag = np.zeros_like(grid, dtype=float)
+        rows = events.loc[mask & events["kind"].ne("infusion")]
+        for index in rows.index:
+            begin = minutes.get(index, np.nan)
+            if not np.isfinite(begin):
+                continue
+            flag[(grid >= begin) & (grid <= begin + window_minutes)] = 1.0
+        return flag
+
+    key = events["drug_key"].fillna("")
+    name = normalize_series(events["drug"]).fillna("")
+    is_propofol = key.str.startswith(propofol_key) | name.str.startswith("propofol")
+    is_pressor = key.str.startswith(pressor_key) | name.str.startswith(pressor_key)
+    hypnotic = events["drug_class"].eq("hypnotic")
+    vasoactive = events["drug_class"].eq("vasoactive")
+    return {"propofol_rate": infusion_rate(is_propofol),
+            "pressor_rate": infusion_rate(is_pressor),
+            "bolus_hypnotic": bolus_window(hypnotic),
+            "bolus_vasoactive": bolus_window(vasoactive)}
+
+
 def resolve_map_list(explicit: Path | None, data_dir: Path) -> Path | None:
     if explicit is not None:
         return explicit if explicit.is_file() else None
@@ -964,7 +1290,8 @@ def to_grid(frame: pd.DataFrame, column: str, grid: np.ndarray,
 
 def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
                   map_list: Path, hemo_list: Path | None,
-                  covariate_list: Path | None
+                  covariate_list: Path | None,
+                  medications: pd.DataFrame | None = None
                   ) -> tuple[pd.DataFrame, dict, list[str]]:
     """One long table: subject_id, minutes, map, sto2, psi, and co / covariates.
 
@@ -980,6 +1307,9 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
     fallback = tuple(int(part) for part
                      in str(args.sto2_fallback_channels).split(",")
                      if part.strip())
+    hemosphere_extra = tuple(
+        part.strip().lower() for part in str(args.hemosphere_extra).split(",")
+        if part.strip().lower() in HEMOSPHERE_EXTRA)
     sto2_fallback_used: list[str] = []
 
     def index_by_id(filepaths: Path | None) -> dict[str, str]:
@@ -1008,7 +1338,8 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
                     "covariate_listed": len(covariate_files),
                     "covariate_matched": 0, "covariate_used": 0,
                     "covariate_columns": {}, "covariate_errors": [],
-                    "covariate_rescaled": [],
+                    "covariate_rescaled": [], "extra_present": {},
+                    "medication_patients": 0, "medication_missing": [],
                     "candidates": len(shared)}
 
     for subject_id in shared:
@@ -1043,7 +1374,7 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
             try:
                 hemo_frame, info = load_hemosphere(
                     hemo_files[subject_id], induction, args.co_column,
-                    args.min_co_sqi)
+                    args.min_co_sqi, hemosphere_extra)
             except Exception as exc:
                 hemo_frame, info = None, {}
                 # A Hemosphere failure costs this patient their CO only; they
@@ -1062,9 +1393,17 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
                 for name in info.get("technology", []):
                     if name not in report["technology"]:
                         report["technology"].append(name)
+            if info.get("extra_present"):
+                for name, count in info["extra_present"].items():
+                    report["extra_present"][name] = \
+                        report["extra_present"].get(name, 0) + (1 if count else 0)
+            if hemo_frame is not None:
+                for name in hemosphere_extra:
+                    if name in hemo_frame.columns and hemo_frame[name].notna().any():
+                        sources.append((hemo_frame[["timestamp", name]], name))
             if hemo_frame is not None and hemo_frame["co"].notna().any():
                 report["used"] += 1
-                sources.append((hemo_frame, "co"))
+                sources.append((hemo_frame[["timestamp", "co"]], "co"))
             elif hemo_frame is not None:
                 report["no_co"].append(subject_id)
 
@@ -1138,6 +1477,19 @@ def build_aligned(args: argparse.Namespace, events: pd.DataFrame,
             skipped.append(f"{subject_id}: no overlapping MAP/cerebral O2/PSi "
                            f"samples")
             continue
+
+        if medications is not None:
+            mine = medications.loc[medications["subject_id"] == subject_id]
+            if mine.empty:
+                report["medication_missing"].append(subject_id)
+            else:
+                report["medication_patients"] += 1
+                for name, values in medication_features(
+                        mine, patient["minutes"].to_numpy(float), induction,
+                        args.drug_window_minutes, args.propofol_key,
+                        args.pressor_key).items():
+                    patient[name] = values
+
         patient.insert(0, "subject_id", subject_id)
         chunks.append(patient)
 
@@ -2332,6 +2684,46 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
         print(f"    {minutes:g} min lag: {format_estimate(out, 3)} "
               f"({out['n_obs']:,} points)")
 
+    # ---- pharmacology, not physiology? -------------------------------------
+    if "bolus_vasoactive" in frame.columns or "bolus_hypnotic" in frame.columns:
+        print("\n  Drugs. Propofol lowers MAP and PSi at the same moment, so "
+              "'deep and hypotensive' can co-occur for a pharmacological "
+              "reason. If the interaction is physiology it should survive "
+              "removing the stretches where a syringe was moving both.")
+        disturbed = pd.Series(False, index=frame.index)
+        for name in ("bolus_vasoactive", "bolus_hypnotic"):
+            if name in frame.columns:
+                disturbed |= frame[name].fillna(0).gt(0)
+        quiet = frame.loc[~disturbed]
+        share = float(disturbed.mean())
+        out = refit(quiet, "away from boluses")
+        if out is None:
+            print(f"    excluding the {share:.0%} of points within "
+                  f"{args.drug_window_minutes:g} min of a bolus: not estimable")
+        else:
+            print(f"    excluding the {share:.0%} of points within "
+                  f"{args.drug_window_minutes:g} min of a bolus: "
+                  f"{format_estimate(out, 3)} "
+                  f"({out['n_patients']} patients, {out['n_obs']:,} points)")
+
+        extra = tuple(name for name in ("propofol_rate", "pressor_rate")
+                      if name in frame.columns and name not in covariates
+                      and frame[name].notna().any())
+        if extra:
+            adjusted_frame = frame.dropna(subset=list(extra))
+            if adjusted_frame["subject_id"].nunique() >= 3:
+                rebuilt = build_design(adjusted_frame, exposure, modifier,
+                                       centers, covariates + extra)
+                drug_fit = fit_within(adjusted_frame, rebuilt.within,
+                                      "drug-rate adjusted",
+                                      step_minutes=args.step_seconds / 60.0)
+                out = drug_fit.contrast({rebuilt.terms["xm"]: gap})
+                print(f"    adjusting for the running "
+                      f"{' and '.join(COVARIATE_LABELS[name] for name in extra)}: "
+                      f"{format_estimate(out, 3)} "
+                      f"({drug_fit.n_patients} patients, "
+                      f"{drug_fit.n_obs:,} points)")
+
     # ---- covariate comparison ----------------------------------------------
     if covariates:
         print("\n  Covariate comparison: the same model without the "
@@ -2407,8 +2799,20 @@ def main() -> int:
           f"  Window: {args.min_minutes} to {args.max_minutes} min "
           f"relative to induction.")
 
+    medications, medication_info = None, {}
+    if args.medications is not None and args.medications.is_file():
+        try:
+            medications, medication_info = load_medications(args.medications)
+        except Exception as exc:
+            print(f"!! Could not read {args.medications}: {exc}\n"
+                  f"   Continuing without the medication analyses.")
+            medications, medication_info = None, {}
+    elif args.medications is not None:
+        print(f"  No medication file at {args.medications}; the drug "
+              f"sensitivity analyses are skipped.")
+
     aligned, report, skipped = build_aligned(args, events, map_list, hemo_list,
-                                             covariate_list)
+                                             covariate_list, medications)
     if aligned.empty:
         sys.stderr.write("\nNo patient had MAP, cerebral O2 and PSi "
                          "overlapping.\n")
@@ -2456,6 +2860,51 @@ def main() -> int:
               f"{report['matched']} matched a patient with MAP, cerebral O2 "
               f"and PSi). The secondary model cannot run.")
 
+    if report["extra_present"] or args.hemosphere_extra.strip():
+        print("\n  Other Hemosphere channels, by how many patients carry any "
+              "reading:")
+        for name, spec in HEMOSPHERE_EXTRA.items():
+            if name not in str(args.hemosphere_extra):
+                continue
+            patients_with = report["extra_present"].get(name, 0)
+            on_grid = (float(aligned[name].notna().mean())
+                       if name in aligned.columns else 0.0)
+            print(f"    {spec['label']:<34} {patients_with:3d} patient(s), "
+                  f"{on_grid:.0%} of aligned time points")
+            if spec["derived"]:
+                print(f"      NOT independent information: {spec['derived']}.")
+
+    if medication_info:
+        print(f"\n  Medications: {medication_info['kept']:,} usable events for "
+              f"{medication_info['patients']} patients in the export; "
+              f"{report['medication_patients']} of the analysed patients "
+              f"matched.")
+        for reason, count in medication_info.get("dropped", {}).items():
+            if count:
+                print(f"    dropped {count} row(s): {reason}")
+        classes = medication_info.get("classes", {})
+        print("    by class: " + ", ".join(f"{name} {count}" for name, count
+                                            in sorted(classes.items())))
+        if medication_info.get("unclassified"):
+            print(f"    not classified (reported, not modelled): "
+                  f"{', '.join(medication_info['unclassified'])}")
+        if report["medication_missing"]:
+            print(f"    {len(report['medication_missing'])} analysed "
+                  f"patient(s) had no medication rows: "
+                  f"{', '.join(report['medication_missing'][:6])}"
+                  + (" ..." if len(report["medication_missing"]) > 6 else ""))
+        for name in ("propofol_rate", "pressor_rate"):
+            if name in aligned.columns:
+                active = float((aligned[name] > 0).mean())
+                print(f"    {COVARIATE_LABELS[name]}: running for "
+                      f"{active:.0%} of aligned time points")
+        for name, label in (("bolus_hypnotic", "hypnotic"),
+                            ("bolus_vasoactive", "vasoactive")):
+            if name in aligned.columns:
+                print(f"    within {args.drug_window_minutes:g} min of a "
+                      f"{label} bolus: "
+                      f"{float(aligned[name].mean()):.0%} of time points")
+
     covariates: tuple[str, ...] = ()
     covariate_coverage: dict[str, float] = {}
     if report["covariate_columns"]:
@@ -2482,11 +2931,28 @@ def main() -> int:
                 print("      not used for adjustment: it covers too little of "
                       "the record (needs >= 80% of points and >= 10 patients)")
     else:
-        print("  Anesthesia-record covariates: none supplied. The models are "
-              "UNADJUSTED for end-tidal CO2, inspired O2 fraction and "
-              "anesthetic concentration — the outline asks for that "
-              "adjustment, and it needs an anesthesia-record file list "
-              "(--covariate-filepaths) that this project does not yet have.")
+        print("  Anesthesia-record covariates: none supplied, so end-tidal CO2 "
+              "and inspired O2 fraction are not in the models.")
+
+    # The propofol infusion rate is the anesthetic exposure the outline asks
+    # for, at least for a TIVA case, and unlike a demographic it moves within a
+    # patient -- so it is a covariate the fixed effects do NOT absorb.
+    for name in ("propofol_rate", "pressor_rate"):
+        if name not in aligned.columns:
+            continue
+        share = float(aligned[name].notna().mean())
+        patients_with = int(aligned.loc[aligned[name].notna(), "subject_id"].nunique())
+        covariate_coverage[name] = share
+        moving = int(aligned.loc[aligned[name].notna()]
+                     .groupby("subject_id")[name].nunique().gt(1).sum())
+        print(f"  {COVARIATE_LABELS[name]}: known for {share:.0%} of time "
+              f"points over {patients_with} patients, and varies within "
+              f"{moving} of them")
+        if share >= 0.8 and patients_with >= 10 and moving >= 5:
+            covariates = covariates + (name,)
+        else:
+            print("    not used for adjustment: it needs >= 80% coverage, "
+                  ">= 10 patients and within-patient movement in >= 5")
 
     if report.get("sto2_fallback"):
         print(f"\n  {len(report['sto2_fallback'])} patient(s) had no valid "
@@ -2639,13 +3105,30 @@ def main() -> int:
         ]
     else:
         table1.append(("Cardiac output", "none usable"))
-    for name in COVARIATE_PATTERNS:
+    for name in list(COVARIATE_PATTERNS) + ["propofol_rate", "pressor_rate"]:
         if name in covariate_coverage:
             table1.append((COVARIATE_LABELS[name],
                            f"{covariate_coverage[name]:.0%} of points, "
                            f"{'used' if name in covariates else 'not used'}"))
         else:
             table1.append((COVARIATE_LABELS[name], "not available"))
+    if medication_info:
+        table1.append(("Medication events used",
+                       f"{medication_info['kept']:,} over "
+                       f"{report['medication_patients']} patients"))
+        table1.append((f"Time points within {args.drug_window_minutes:g} min "
+                       f"of a bolus",
+                       f"{float((aligned.get('bolus_vasoactive', pd.Series(0, index=aligned.index)).fillna(0).gt(0) | aligned.get('bolus_hypnotic', pd.Series(0, index=aligned.index)).fillna(0).gt(0)).mean()):.0%}"))
+    for name, spec in HEMOSPHERE_EXTRA.items():
+        if name not in str(args.hemosphere_extra):
+            continue
+        if name in aligned.columns and aligned[name].notna().any():
+            table1.append((spec["label"],
+                           f"{float(aligned[name].notna().mean()):.0%} of "
+                           f"points"
+                           + (", derived" if spec["derived"] else "")))
+        else:
+            table1.append((spec["label"], "not recorded"))
     table1.append(("Lag-1 residual autocorrelation",
                    f"{primary['fit'].rho1:.3f}"))
     render_table(table1, [46, 40],
@@ -2784,7 +3267,21 @@ def main() -> int:
     bootstrap and leave-one-patient-out checks address the same concern from
     three directions.
   * Association, not causation. MAP and PSi move together with surgical events,
-    drug boluses and position changes; none of this is randomized.
+    drug boluses and position changes; none of this is randomized.""")
+    if medication_info:
+        print("""  * Drugs move both variables at once. Propofol lowers MAP and PSi together,
+    so "deep and hypotensive" can co-occur pharmacologically rather than
+    physiologically. This is the main alternative explanation for the
+    interaction, and the sensitivity section attacks it directly: the model is
+    adjusted for the running infusion rates where they are available, and
+    refitted with the minutes around every bolus removed. An interaction that
+    survives both is not simply the syringe.""")
+    print("""  * What the models leave out of the Hemosphere export. SVR, SVRI, CI and SVI
+    are algebraic functions of CO, MAP, CVP and body size -- SVR is exactly
+    80 x (MAP - CVP) / CO in this data -- so they carry no information the
+    models do not already have, and a coefficient on one of them would be a
+    functional-form artefact rather than a vasomotor effect. CVP is a manually
+    entered constant, not a measurement.
   * The measurement. NIRS cerebral oximetry is venous-weighted, samples frontal
     cortex only, and is susceptible to extracranial contamination, so it is an
     index of cerebral oxygen balance rather than a direct measure of cerebral
