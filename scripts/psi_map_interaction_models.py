@@ -1876,6 +1876,90 @@ def slope_difference(fit: Fit, design: Design, high: float, low: float,
     return fit.contrast({design.terms["xm"]: step * (high - low)})
 
 
+def partial_residuals(frame: pd.DataFrame, design: Design, fit: Fit,
+                      outcome: str = "sto2") -> tuple[np.ndarray, np.ndarray]:
+    """Observed data put on the same axes the modelled line is drawn on.
+
+    A fitted line laid over raw points would not line up, because the raw
+    points still carry everything else in the model -- the PSi main effect, the
+    covariates, each patient's own level. The partial residual strips those out
+    and leaves the exposure's own contribution plus the noise, which is exactly
+    what the plotted line claims to describe. If the line and the binned points
+    disagree, the straight-line assumption is wrong, and that is worth seeing
+    rather than inferring.
+    """
+    values = design.within.to_numpy(float)
+    y = frame[outcome].to_numpy(float)
+    codes = pd.factorize(frame["subject_id"].to_numpy())[0]
+    counts = np.bincount(codes).astype(float)
+
+    def demean(column: np.ndarray) -> np.ndarray:
+        sums = np.zeros(len(counts))
+        np.add.at(sums, codes, column)
+        return column - (sums / counts)[codes]
+
+    centered = np.column_stack([demean(values[:, i])
+                                for i in range(values.shape[1])])
+    target = demean(y)
+    residual = target - centered @ fit.params
+    keep = [design.within.columns.get_loc(design.terms[name])
+            for name in ("x", "xm", "xb") if design.terms[name] in design.within.columns]
+    partial = residual + centered[:, keep] @ fit.params[keep]
+    return centered[:, design.within.columns.get_loc(design.terms["x"])], partial
+
+
+def paired_patient_slopes(frame: pd.DataFrame, exposure: str, modifier: str,
+                          deep: float, light: float, window: float, step: float,
+                          min_points: int = 30,
+                          min_range: float = 10.0) -> pd.DataFrame:
+    """Each patient's own exposure slope, measured twice: once deep, once light.
+
+    This is the model-free version of the headline claim. The model says the
+    slope changes with depth on average; this asks how many individual patients
+    it changed in, which is a different and more clinically useful question. A
+    patient only appears if they spent enough time at BOTH depths with enough
+    pressure movement at each to fit a line worth having.
+    """
+    rows: list[dict] = []
+    for subject_id, part in frame.groupby("subject_id", sort=True):
+        slopes: dict[str, float] = {}
+        for label, centre in (("deep", deep), ("light", light)):
+            window_rows = part.loc[(part[modifier] - centre).abs() <= window]
+            if len(window_rows) < min_points:
+                break
+            x = window_rows[exposure].to_numpy(float)
+            y = window_rows["sto2"].to_numpy(float)
+            if float(x.max() - x.min()) < min_range or not np.isfinite(x).all():
+                break
+            slopes[label] = float(np.polyfit(x, y, 1)[0]) * step
+        if len(slopes) == 2:
+            rows.append({"subject_id": subject_id, **slopes,
+                         "difference": slopes["deep"] - slopes["light"]})
+    return pd.DataFrame(rows)
+
+
+def paired_test(differences: np.ndarray) -> dict:
+    """Wilcoxon signed-rank, with the small-sample floor stated rather than hidden.
+
+    With n pairs the smallest P the test can return is 2/2^n, so at n = 6 even a
+    perfectly consistent result can only reach 0.031 and at n = 5, 0.0625. A
+    bare P near that floor reads as a near-miss when it is really the test
+    running out of room.
+    """
+    values = np.asarray([value for value in differences if np.isfinite(value)])
+    out = {"n": int(len(values))}
+    if len(values) < 3:
+        return out | {"p": float("nan"), "median": float("nan"), "floor": float("nan")}
+    out["median"] = float(np.median(values))
+    out["positive"] = int((values > 0).sum())
+    out["floor"] = 2.0 / (2.0 ** len(values))
+    try:
+        out["p"] = float(stats.wilcoxon(values).pvalue)
+    except Exception:
+        out["p"] = float("nan")
+    return out
+
+
 def format_estimate(result: dict, digits: int = 3, unit: str = "") -> str:
     if not np.isfinite(result.get("estimate", np.nan)):
         return "not estimable"
@@ -2114,14 +2198,22 @@ def make_marginal_figure(fit: Fit, design: Design, exposure: str, modifier: str,
     psi_grid = np.linspace(psi_low, psi_high, 80)
     absolute_center = float(np.round(frame[exposure].mean(), 1))
 
-    figure = plt.figure(figsize=(17.0, 6.8))
-    spec = figure.add_gridspec(1, 3, wspace=0.34, left=0.055, right=0.985,
-                               top=0.76, bottom=0.12)
+    figure = plt.figure(figsize=(14.5, 11.0))
+    spec = figure.add_gridspec(2, 2, wspace=0.26, hspace=0.34, left=0.07,
+                               right=0.975, top=0.86, bottom=0.07)
     ax_a = figure.add_subplot(spec[0, 0])
     ax_b = figure.add_subplot(spec[0, 1])
-    ax_c = figure.add_subplot(spec[0, 2])
+    ax_c = figure.add_subplot(spec[1, 0])
+    ax_d = figure.add_subplot(spec[1, 1])
 
     # ---- A: modelled cerebral O2 change against the exposure ---------------
+    # A window around each representative PSi, so the observed points drawn
+    # under a line are the ones that line actually claims to describe.
+    spacing = (min(np.diff(representative)) if len(representative) > 1 else 20.0)
+    window = max(5.0, spacing / 2.0)
+    observed_x, observed_y = partial_residuals(frame, design, fit)
+    psi_column = frame[modifier].to_numpy(float)
+
     for index, psi in enumerate(representative):
         offset = psi - design.reference
         estimates, lows, highs = [], [], []
@@ -2132,8 +2224,26 @@ def make_marginal_figure(fit: Fit, design: Design, exposure: str, modifier: str,
             lows.append(result["low"])
             highs.append(result["high"])
         color = BAND_COLORS[index % len(BAND_COLORS)]
+
+        near = np.abs(psi_column - psi) <= window
+        if near.sum() > 40:
+            edges = np.quantile(observed_x[near], np.linspace(0, 1, 11))
+            edges = np.unique(edges)
+            if len(edges) > 2:
+                middle = np.digitize(observed_x[near], edges[1:-1])
+                centres, means = [], []
+                for bucket in range(len(edges) - 1):
+                    chosen = middle == bucket
+                    if chosen.sum() < 10:
+                        continue
+                    centres.append(float(np.median(observed_x[near][chosen])))
+                    means.append(float(np.mean(observed_y[near][chosen])))
+                ax_a.plot(centres, means, "o", color=color, markersize=5.5,
+                          markerfacecolor="white", markeredgewidth=1.6,
+                          zorder=4, linestyle="none")
+
         ax_a.fill_between(grid, lows, highs, color=color, alpha=0.16, linewidth=0)
-        ax_a.plot(grid, estimates, color=color, linewidth=2.4,
+        ax_a.plot(grid, estimates, color=color, linewidth=2.4, zorder=3,
                   label=f"PSi {psi:g}")
     ax_a.axhline(0, color="#999999", linewidth=0.9, linestyle=":")
     ax_a.axvline(0, color="#999999", linewidth=0.9, linestyle=":")
@@ -2141,14 +2251,17 @@ def make_marginal_figure(fit: Fit, design: Design, exposure: str, modifier: str,
                     f"({axis['unit']})")
     ax_a.set_ylabel("Modelled change in cerebral O2 (%)")
     ax_a.set_title(f"A. Within-patient {axis['short']}-cerebral O2 relationship\n"
-                   f"at representative PSi values", fontsize=11, loc="left")
+                   f"at representative PSi values (hollow dots = observed)",
+                   fontsize=11, loc="left")
     ax_a.legend(frameon=False, fontsize=9, loc="upper left",
                 title="PSi held at", title_fontsize=9)
     ax_a.grid(alpha=0.18)
     ax_a.annotate(f"0 = each patient's own average {axis['short']}\n"
-                  f"(cohort average {absolute_center:g} {axis['unit']})",
+                  f"(cohort average {absolute_center:g} {axis['unit']}); the "
+                  f"lines must meet there\nDots: binned partial residuals "
+                  f"within {window:g} PSi of each value",
                   (0.98, 0.03), xycoords="axes fraction", ha="right",
-                  va="bottom", fontsize=8.2, color="#666666")
+                  va="bottom", fontsize=8.0, color="#666666")
 
     # ---- B: the slope as a continuous function of PSi ----------------------
     estimates, lows, highs = [], [], []
@@ -2228,14 +2341,80 @@ def make_marginal_figure(fit: Fit, design: Design, exposure: str, modifier: str,
                    fontsize=11, loc="left")
     ax_c.grid(alpha=0.18, axis="x")
 
+    # ---- D: one dot per patient --------------------------------------------
+    # Panels A to C are cohort averages. They cannot tell "the slope steepens
+    # with depth in most patients" apart from "it steepens enormously in a
+    # handful and not at all in the rest", and those mean different things at
+    # the bedside. This panel answers that by measuring each patient twice.
+    deep, light = representative[0], representative[-1]
+    paired = paired_patient_slopes(frame, exposure, modifier, deep, light,
+                                   window, step,
+                                   min_range=10.0 if exposure == "map" else 0.8)
+    if len(paired) >= 3:
+        test = paired_test(paired["difference"].to_numpy(float))
+        limits = np.concatenate([paired["light"].to_numpy(float),
+                                 paired["deep"].to_numpy(float)])
+        low_limit, high_limit = float(limits.min()), float(limits.max())
+        pad = max((high_limit - low_limit) * 0.12, 0.25)
+        bounds = [low_limit - pad, high_limit + pad]
+        ax_d.plot(bounds, bounds, color="#999999", linewidth=1.2, linestyle="--",
+                  label="no change with depth")
+        steeper = paired["deep"] > paired["light"]
+        ax_d.plot(paired.loc[~steeper, "light"], paired.loc[~steeper, "deep"],
+                  "o", color="#495057", markersize=7, alpha=0.75,
+                  label=f"flatter when deep ({int((~steeper).sum())})")
+        ax_d.plot(paired.loc[steeper, "light"], paired.loc[steeper, "deep"],
+                  "o", color="#c00000", markersize=7, alpha=0.8,
+                  label=f"steeper when deep ({int(steeper.sum())})")
+        ax_d.axhline(0, color="#cccccc", linewidth=0.8)
+        ax_d.axvline(0, color="#cccccc", linewidth=0.8)
+        ax_d.set_xlim(bounds)
+        ax_d.set_ylim(bounds)
+        ax_d.set_xlabel(f"That patient's slope near PSi {light:g} (lighter)")
+        ax_d.set_ylabel(f"That patient's slope near PSi {deep:g} (deeper)")
+        caption = (f"median paired change {test.get('median', float('nan')):+.3f}"
+                   f", {test['n']} patients")
+        if np.isfinite(test.get("p", np.nan)):
+            caption += f"\nWilcoxon signed-rank P {format_p(test['p'])}"
+            at_floor = test["p"] <= test["floor"] * 1.5
+            if at_floor and test["floor"] > 0.001:
+                # Few enough pairs that the test cannot reach a small P however
+                # consistent the result is -- worth saying, or the P reads as a
+                # near-miss when it is the test running out of room.
+                caption += (f"\nbut {test['n']} pairs cannot take this test "
+                            f"below {test['floor']:.3g} however consistent "
+                            f"they are")
+            elif at_floor:
+                caption += (f"\n— the smallest value {test['n']} pairs can "
+                            f"give: every patient moved the same way")
+        ax_d.annotate(caption, (0.03, 0.97), xycoords="axes fraction",
+                      ha="left", va="top", fontsize=8.6, color="#333333")
+        ax_d.legend(frameon=False, fontsize=8.5, loc="lower right")
+    else:
+        ax_d.axis("off")
+        ax_d.annotate(
+            f"Too few patients spent enough time at BOTH PSi {deep:g} and "
+            f"PSi {light:g}\nwith enough {axis['short']} movement at each to "
+            f"fit a slope twice.\n\nThe cohort estimate in panels A to C still "
+            f"stands; what cannot be\nshown is how consistent it is from "
+            f"patient to patient.",
+            (0.5, 0.5), xycoords="axes fraction", ha="center", va="center",
+            fontsize=9.5, color="#666666")
+    ax_d.set_title(f"D. Each patient measured twice\n"
+                   f"(cerebral O2 change {axis['step_label']} of "
+                   f"{axis['short']})", fontsize=11, loc="left")
+    ax_d.grid(alpha=0.18)
+
     adjustment = (", adjusted for " + ", ".join(COVARIATE_LABELS[name]
                                                 for name in adjusted_for)
                   if adjusted_for else ", unadjusted (no covariate file supplied)")
     note = (f"Within-patient estimates (patient-mean decomposition with "
             f"patient fixed effects), patient-clustered 95% CIs. "
-            f"{fit.n_patients} patients, {fit.n_obs:,} time points{adjustment}.")
-    figure.suptitle(f"{title}\n" + "\n".join(textwrap.wrap(note, 150)),
-                    fontsize=12.5, x=0.055, y=0.975, ha="left", va="top")
+            f"{fit.n_patients} patients, {fit.n_obs:,} time points{adjustment}. "
+            f"Panels A to C are the model; panel D measures each patient "
+            f"separately and assumes nothing.")
+    figure.suptitle(f"{title}\n" + "\n".join(textwrap.wrap(note, 125)),
+                    fontsize=12.5, x=0.07, y=0.985, ha="left", va="top")
     figure.savefig(output_path, dpi=200)
     plt.close(figure)
     print(f"  wrote {output_path}")
