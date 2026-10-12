@@ -138,6 +138,47 @@ INDUCTION_PREFIX = "what time was induction"
 OR_ENTRY_PREFIX = "what time did the patient enter the or"
 SURGERY_DATE_PREFIX = "date of surgery"
 
+# Baseline characteristics for Table 1, keyed to the start of the REDCap label
+# (matched case-insensitively after collapsing repeated spaces). A field the
+# export does not carry is reported as unavailable rather than guessed at.
+CHARACTERISTIC_COLUMNS = {
+    "age": "age on date of surgery",
+    "sex": "sex",
+    "height": "height (cm)",
+    "weight": "actual weight",
+    "bmi": "bmi",
+    "asa": "asa class",
+    "procedure": "surgical procedure",
+    "race": "race",
+    "ethnicity": "ethnicity",
+    "smoking": "smoking status",
+    "monk_forehead": "monk skin tone (1-10) forehead",
+    "monk_hand": "monk skin tone (1-10) hand",
+    "preop_map": "pre-operative nibp map",
+    "preop_spo2": "pre-operative spo2",
+    "a1c": "a1c",
+    "anesthesiologist": "anesthesiologist",
+}
+
+# How each one is labelled and summarized in Table 1.
+CHARACTERISTIC_LAYOUT: tuple[tuple[str, str, str, int], ...] = (
+    ("age", "Age, years", "numeric", 1),
+    ("sex", "Sex", "category", 0),
+    ("bmi", "BMI, kg/m2", "numeric", 1),
+    ("height", "Height, cm", "numeric", 0),
+    ("weight", "Weight, kg", "numeric", 1),
+    ("asa", "ASA class", "category", 0),
+    ("comorbidities", "Comorbid conditions, count", "numeric", 0),
+    ("a1c", "HbA1c, % (where measured)", "numeric", 1),
+    ("smoking", "Smoking status", "category", 0),
+    ("race", "Race", "category", 0),
+    ("ethnicity", "Ethnicity", "category", 0),
+    ("monk_forehead", "Monk skin tone, forehead (1-10)", "numeric", 0),
+    ("preop_map", "Pre-operative NIBP MAP, mmHg", "numeric", 0),
+    ("preop_spo2", "Pre-operative SpO2, %", "numeric", 0),
+    ("procedure", "Surgical procedure", "category", 0),
+)
+
 MAP_LIST_FALLBACKS = ("map_filepaths.csv", "btb_filepaths.csv",
                       "b2b_filepaths.csv", "b2b_filepath.csv",
                       "btb_filepath.csv")
@@ -491,8 +532,8 @@ def find_record_key(redcap: pd.DataFrame) -> str | None:
     return None
 
 
-def load_event_times(redcap_path: Path) -> tuple[pd.DataFrame, list[str]]:
-    """Per-patient induction and OR-entry instants."""
+def load_redcap(redcap_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Per-patient event times and baseline characteristics, from one read."""
     redcap = pd.read_csv(redcap_path, low_memory=False)
 
     id_column = find_column(redcap, REDCAP_ID_PREFIX)
@@ -561,7 +602,87 @@ def load_event_times(redcap_path: Path) -> tuple[pd.DataFrame, list[str]]:
     events = events.loc[events["subject_id"].notna() & events["subject_id"].ne("")]
     events = (events.sort_values("subject_id").groupby("subject_id", as_index=True)
               .agg(induction=("induction", "first"), or_entry=("or_entry", "first")))
-    return events, notes
+
+    characteristics = extract_characteristics(redcap, subject_ids, record_key)
+    return events, characteristics, notes
+
+
+def normalize(name: object) -> str:
+    """Collapse a column name to one lowercase, single-spaced form for matching.
+
+    REDCap labels carry doubled spaces where the data dictionary had line
+    breaks -- 'Monk skin tone (1-10)  Forehead:' is two spaces, and a literal
+    match against one space quietly finds nothing.
+    """
+    return re.sub(r"\s+", " ", str(name)).strip().lower()
+
+
+def match_characteristic(redcap: pd.DataFrame, prefix: str) -> str | None:
+    """First column whose normalized name starts with this prefix."""
+    prefix = normalize(prefix)
+    for column in redcap.columns:
+        if normalize(column).startswith(prefix):
+            return column
+    return None
+
+
+def extract_characteristics(redcap: pd.DataFrame, subject_ids: pd.Series,
+                            record_key: str | None) -> pd.DataFrame:
+    """One row per patient of the baseline characteristics, for Table 1.
+
+    These are PATIENT-LEVEL and time-invariant, which decides what they can be
+    used for. Under patient fixed effects every one of them is absorbed by the
+    patient's own intercept -- age cannot confound a comparison of a patient
+    against themselves, because it does not change during the case. So they
+    describe the cohort in Table 1, and they are candidates for asking whether
+    the interaction DIFFERS between kinds of patients. They are not adjustment
+    covariates for the within-patient models, and adding them there would
+    change nothing at all.
+    """
+    columns: dict[str, pd.Series] = {}
+    for name, prefix in CHARACTERISTIC_COLUMNS.items():
+        column = match_characteristic(redcap, prefix)
+        if column is None:
+            continue
+        values = redcap[column]
+        if record_key is not None:
+            # Each REDCap instrument writes its own row, so a field belongs to
+            # the record rather than the row it happens to sit on.
+            grouped = redcap.groupby(record_key, sort=False)[column]
+            values = grouped.ffill()
+            values = redcap.assign(**{column: values}).groupby(
+                record_key, sort=False)[column].bfill()
+        columns[name] = values
+
+    # "Past Medical History (choice=X)" arrives as one Checked/Unchecked column
+    # per condition; the count of conditions is the summary worth tabling.
+    history = [column for column in redcap.columns
+               if normalize(column).startswith("past medical history")
+               and "choice=" in normalize(column)
+               and "none of the above" not in normalize(column)]
+    if history:
+        checked = pd.DataFrame(
+            {column: redcap[column].astype("string").str.strip().str.lower()
+             .eq("checked") for column in history})
+        values = checked.sum(axis=1)
+        if record_key is not None:
+            any_checked = pd.DataFrame(
+                {column: redcap[column].notna() for column in history}
+            ).any(axis=1)
+            values = values.where(any_checked)
+            frame = redcap.assign(_count=values)
+            values = frame.groupby(record_key, sort=False)["_count"].ffill()
+            values = frame.assign(_count=values).groupby(
+                record_key, sort=False)["_count"].bfill()
+        columns["comorbidities"] = values
+
+    if not columns:
+        return pd.DataFrame()
+    table = pd.DataFrame(columns)
+    table.insert(0, "subject_id", subject_ids.to_numpy())
+    table = table.loc[table["subject_id"].notna() & table["subject_id"].ne("")]
+    # One row per patient: take the first non-blank value seen for each field.
+    return table.groupby("subject_id", as_index=True).first()
 
 
 def as_datetime(values: pd.Series) -> pd.Series:
@@ -1892,6 +2013,72 @@ def describe(values: pd.Series, digits: int = 1) -> str:
             f"({values.quantile(.25):.{digits}f}-{values.quantile(.75):.{digits}f})")
 
 
+def characteristic_rows(characteristics: pd.DataFrame, subjects: list[str],
+                        max_levels: int = 6) -> tuple[list[tuple[str, str]],
+                                                      list[str]]:
+    """Table 1's top half: the cohort, summarized field by field.
+
+    Numeric fields get median (IQR), categorical fields get one line per level
+    with n (%). A field the export did not carry, or carried blank for this
+    cohort, is listed as unavailable: a reader of Table 1 needs to know the
+    difference between "we measured this and it was unremarkable" and "we never
+    had it".
+    """
+    rows: list[tuple[str, str]] = []
+    missing: list[str] = []
+    if characteristics.empty:
+        return rows, [label for _key, label, _kind, _digits in CHARACTERISTIC_LAYOUT]
+
+    present = characteristics.reindex(subjects)
+    total = len(present)
+    for key, label, kind, digits in CHARACTERISTIC_LAYOUT:
+        if key not in present.columns:
+            missing.append(label)
+            continue
+        values = present[key]
+        if kind == "numeric":
+            numeric = pd.to_numeric(values, errors="coerce").dropna()
+            if numeric.empty:
+                missing.append(label)
+                continue
+            suffix = (f"  [{len(numeric)} of {total}]"
+                      if len(numeric) < total else "")
+            rows.append((label, describe(numeric, digits) + suffix))
+            continue
+
+        text = values.astype("string").str.strip()
+        text = text.loc[text.notna() & text.ne("") & text.str.lower().ne("nan")]
+        if text.empty:
+            missing.append(label)
+            continue
+        counts = text.value_counts()
+        # An ordered scale reads in its own order, not in order of how common
+        # each level happens to be: ASA 2, 3, 4 -- never 3, 2, 4.
+        numeric_levels = pd.to_numeric(pd.Series(counts.index), errors="coerce")
+        if numeric_levels.notna().all():
+            counts = counts.iloc[np.argsort(numeric_levels.to_numpy())]
+            shown_levels, overflow = counts, None
+        else:
+            shown_levels = counts.head(max_levels)
+            overflow = counts.iloc[max_levels:] if len(counts) > max_levels else None
+        rows.append((label, f"{len(text)} of {total} recorded"))
+        for level, count in shown_levels.items():
+            shown = str(level)
+            # Surgical-procedure labels run to a full sentence; the leading
+            # words are what distinguishes them, and the rest would overflow
+            # the rendered column and be cut mid-word anyway.
+            if len(shown) > 38:
+                shown = shown[:35].rstrip(" ,(-") + "..."
+            rows.append((f"    {shown}",
+                         f"{count} ({100.0 * count / total:.0f}%)"))
+        if overflow is not None and len(overflow):
+            rest = int(overflow.sum())
+            plural = "category" if len(overflow) == 1 else "categories"
+            rows.append((f"    other ({len(overflow)} {plural})",
+                         f"{rest} ({100.0 * rest / total:.0f}%)"))
+    return rows, missing
+
+
 def run_model(frame: pd.DataFrame, exposure: str, modifier: str,
               centers: dict[str, float], representative: list[float],
               covariates: tuple[str, ...], args: argparse.Namespace,
@@ -2199,7 +2386,7 @@ def main() -> int:
         return 1
 
     banner("Sources and cleaning rules")
-    events, notes = load_event_times(args.redcap)
+    events, characteristics, notes = load_redcap(args.redcap)
     if notes:
         print("  REDCap repairs:")
         for note in notes:
@@ -2403,7 +2590,32 @@ def main() -> int:
         f"{primary['fit'].n_obs:,} time points.")
 
     # ---- tables -------------------------------------------------------------
-    table1: list[tuple[str, ...]] = [("Item", "Value")]
+    subjects = sorted(aligned["subject_id"].unique())
+    baseline, baseline_missing = characteristic_rows(characteristics, subjects)
+
+    banner("Baseline characteristics (the top half of Table 1)")
+    if baseline:
+        for label, value in baseline:
+            print(f"  {label:<46} {value}")
+    else:
+        print("  None of the baseline fields were found in the REDCap export.")
+    if baseline_missing:
+        print(f"\n  Not available in the export: "
+              f"{', '.join(baseline_missing)}.")
+    print("\n  These are patient-level and do not change during a case, so the "
+          "patient fixed effects absorb every one of them: they cannot "
+          "confound a comparison of a patient against themselves, and adding "
+          "them to the models would change nothing. They describe the cohort, "
+          "and they are the natural candidates for asking whether the "
+          "interaction DIFFERS between kinds of patients — a separate "
+          "question from the one the outline poses.")
+
+    table1: list[tuple[str, ...]] = [("Characteristic", f"Value (n = {n_patients})")]
+    if baseline:
+        table1.append(("PATIENTS", ""))
+        table1 += baseline
+        table1.append(("", ""))
+    table1.append(("DATA", ""))
     table1 += [
         ("Patients analysed", f"{n_patients}"),
         ("Patients with all three required files", f"{report['candidates']}"),
@@ -2436,15 +2648,24 @@ def main() -> int:
             table1.append((COVARIATE_LABELS[name], "not available"))
     table1.append(("Lag-1 residual autocorrelation",
                    f"{primary['fit'].rho1:.3f}"))
-    render_table(table1, [46, 40], "Table 1. Data coverage and distributions",
-                 "Values are median (IQR) unless stated. Grid: every signal "
-                 "resampled to a common clock per patient, never interpolated "
-                 "across a gap wider than "
-                 f"{args.max_gap_seconds:g} s.\nMAP kept where databad == 0; "
+    render_table(table1, [46, 40],
+                 "Table 1. Cohort characteristics, data coverage and "
+                 "distributions",
+                 "Numeric fields are median (IQR); categorical fields are n (%) "
+                 "of the analysed cohort. A count in brackets marks a field "
+                 "recorded for only some patients.\n"
+                 "Baseline characteristics come from the REDCap export and are "
+                 "patient-level, so the patient fixed effects absorb them; they "
+                 "describe the cohort rather than adjust the models.\n"
+                 "Grid: every signal resampled to a common clock per patient, "
+                 "never interpolated across a gap wider than "
+                 f"{args.max_gap_seconds:g} s. MAP kept where databad == 0; "
                  f"PSi where the monitor did not write '-'; cerebral O2 "
                  f"averaged over valid channels {args.sto2_channels} "
                  f"(fallback {args.sto2_fallback_channels}); CO where CO_SQI "
-                 f">= {args.min_co_sqi:g}.",
+                 f">= {args.min_co_sqi:g}."
+                 + (f"\nNot available in this export: "
+                    f"{', '.join(baseline_missing)}." if baseline_missing else ""),
                  args.outdir / "table1_data_coverage.png")
 
     table2: list[tuple[str, ...]] = [
@@ -2567,7 +2788,18 @@ def main() -> int:
   * The measurement. NIRS cerebral oximetry is venous-weighted, samples frontal
     cortex only, and is susceptible to extracranial contamination, so it is an
     index of cerebral oxygen balance rather than a direct measure of cerebral
-    oxygen delivery. PSi is a processed-EEG index, not a measure of CMRO2.
+    oxygen delivery. PSi is a processed-EEG index, not a measure of CMRO2.""")
+    if "monk_forehead" in getattr(characteristics, "columns", []):
+        print("""  * Skin pigmentation. NIRS readings vary with skin pigmentation, and the
+    forehead Monk scale is recorded for this cohort (Table 1). Because the
+    models are within-patient, pigmentation cannot bias the slopes — it does
+    not change during a case, so the patient's own intercept absorbs it. It
+    would matter for any comparison of absolute cerebral O2 BETWEEN patients,
+    which this analysis deliberately does not make.""")
+    print("""  * Baseline characteristics. Age, sex, BMI, ASA class and the rest are
+    patient-level and therefore absorbed by the patient fixed effects. They
+    are reported in Table 1 to describe the cohort; they are not adjustment
+    covariates here, and adding them would change no estimate.
   * What the interaction does not say. A changing slope says the MAP-cerebral
     O2 relationship differs with depth. It does not identify a lower limit of
     autoregulation, and the models here are linear in MAP over the observed
