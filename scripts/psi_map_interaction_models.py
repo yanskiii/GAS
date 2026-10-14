@@ -3728,18 +3728,31 @@ def main() -> int:
                 collected.append((f"CHANGE model, {minutes:g}-min horizon",
                                   new.contrast({rebuilt.terms["xm"]: gap})))
 
-        # The other oximetry sensor, end to end. Averaging CH1 with CH2 would
-        # mix two probes on different sides of the forehead; running the whole
-        # analysis again on CH2 asks the better question -- does the other
-        # sensor tell the same story? -- and that is a stronger check than
-        # averaging the two into one number that belongs to neither.
+        # Every way of reading the oximeter, shown side by side. CH1 is the
+        # prespecified outcome; the other sensor and the average of the two
+        # are run end to end as well, so the choice is visible rather than
+        # something to be made after seeing which one is significant. If all
+        # three agree, that is a point in the result's favour; if they do not,
+        # that is the finding, and it is about the sensors.
+        alternatives: list[tuple[str, str, str]] = []
         sensitivity_channels = str(args.sto2_sensitivity_channels).strip()
         if sensitivity_channels:
-            banner(f"SENSITIVITY — repeated on cerebral-oximetry channel(s) "
-                   f"{sensitivity_channels}")
+            alternatives.append(
+                (f"cerebral O2 from channel {sensitivity_channels}",
+                 sensitivity_channels, str(args.sto2_sensitivity_fallback)))
+            primary_channels = str(args.sto2_channels).strip()
+            if "," not in primary_channels:
+                averaged = f"{primary_channels},{sensitivity_channels}"
+                alternatives.append(
+                    (f"cerebral O2 averaged over channels {averaged}", averaged,
+                     f"{args.sto2_fallback_channels},"
+                     f"{args.sto2_sensitivity_fallback}"))
+
+        for label, channels, fallback in alternatives:
+            banner(f"SENSITIVITY — repeated with {label}")
             other = argparse.Namespace(**vars(args))
-            other.sto2_channels = sensitivity_channels
-            other.sto2_fallback_channels = str(args.sto2_sensitivity_fallback)
+            other.sto2_channels = channels
+            other.sto2_fallback_channels = fallback
             try:
                 alternative, _report, _skipped = build_aligned(
                     other, events, map_list, hemo_list, covariate_list,
@@ -3748,42 +3761,37 @@ def main() -> int:
                 alternative = pd.DataFrame()
                 print(f"  Could not rebuild on those channels: {exc}")
             if alternative.empty:
-                print("  No patient had usable data on that sensor.")
-            else:
-                print(f"  {alternative['subject_id'].nunique()} patients, "
-                      f"{len(alternative):,} time points on channel(s) "
-                      f"{sensitivity_channels}.")
-                for exposure, collected in (("map", map_variants),
-                                            ("co", co_variants)):
-                    if not collected:
+                print("  No patient had usable data that way.")
+                continue
+            print(f"  {alternative['subject_id'].nunique()} patients, "
+                  f"{len(alternative):,} time points.")
+            for exposure, collected in (("map", map_variants),
+                                        ("co", co_variants)):
+                if not collected:
+                    continue
+                source = alternative
+                if exposure == "co":
+                    if "co" not in alternative.columns:
                         continue
-                    source = alternative
-                    if exposure == "co":
-                        if "co" not in alternative.columns:
-                            continue
-                        source = alternative.dropna(subset=["co"])
-                    if covariates:
-                        source = source.dropna(subset=list(covariates))
-                    if source.empty or source["subject_id"].nunique() < 3:
-                        continue
-                    rebuilt = build_design(source, exposure, "psi", centers,
-                                           covariates)
-                    new = fit_within(source, rebuilt.within,
-                                     f"channel {sensitivity_channels}",
-                                     step_minutes=args.step_seconds / 60.0)
-                    if not np.isfinite(new.params).all():
-                        continue
-                    gap = (AXES[exposure]["step"]
-                           * (representative[-1] - representative[0]))
-                    out = new.contrast({rebuilt.terms["xm"]: gap})
-                    out.update({"n_patients": new.n_patients,
-                                "n_obs": new.n_obs})
-                    collected.append(
-                        (f"cerebral O2 from channel {sensitivity_channels}",
-                         out))
-                    print(f"    {AXES[exposure]['short']}: "
-                          f"{format_estimate(out, 3)} "
-                          f"({new.n_patients} patients, {new.n_obs:,} points)")
+                    source = alternative.dropna(subset=["co"])
+                if covariates:
+                    source = source.dropna(subset=list(covariates))
+                if source.empty or source["subject_id"].nunique() < 3:
+                    continue
+                rebuilt = build_design(source, exposure, "psi", centers,
+                                       covariates)
+                new = fit_within(source, rebuilt.within, label,
+                                 step_minutes=args.step_seconds / 60.0)
+                if not np.isfinite(new.params).all():
+                    continue
+                gap = (AXES[exposure]["step"]
+                       * (representative[-1] - representative[0]))
+                out = new.contrast({rebuilt.terms["xm"]: gap})
+                out.update({"n_patients": new.n_patients, "n_obs": new.n_obs})
+                collected.append((label, out))
+                print(f"    {AXES[exposure]['short']}: "
+                      f"{format_estimate(out, 3)} "
+                      f"({new.n_patients} patients, {new.n_obs:,} points)")
 
         panels = [
             ("MAP x PSi — the difference between the MAP slope at "
