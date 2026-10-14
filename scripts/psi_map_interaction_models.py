@@ -307,7 +307,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    base = Path("/N/project/Analgesia_BDproject/PR/scripts_PR/10-11 Mixed Models")
+    # Write beside the script, whatever folder it has been copied into. A
+    # hardcoded dated folder goes stale the moment the script is moved, and
+    # then the run quietly fills a directory nobody is looking at while the
+    # previous run's figures sit in the one that is open.
+    base = Path(__file__).resolve().parent
     data = Path("/N/project/Analgesia_BDproject/PR/data")
 
     group = parser.add_argument_group("data sources")
@@ -347,7 +351,9 @@ def parse_args() -> argparse.Namespace:
                        help="REDCap labeled export, for induction, OR entry "
                             "and the Table 1 baseline characteristics.")
     group.add_argument("--outdir", type=Path, default=base / "output",
-                       help="Where the figures and table images are written.")
+                       help="Where the figures are written. Defaults to an "
+                            "'output' folder beside this script, so a run "
+                            "always lands next to the copy that produced it.")
 
     group = parser.add_argument_group("signal cleaning (same rules as the "
                                       "stratified scatter script)")
@@ -361,11 +367,23 @@ def parse_args() -> argparse.Namespace:
                             "spread away.")
     group.add_argument("--max-hours", type=float, default=24.0,
                        help="Sanity cap on one patient's record span (24 h).")
-    group.add_argument("--sto2-channels", default="1,2",
-                       help="Cerebral-oximetry channels averaged when valid.")
-    group.add_argument("--sto2-fallback-channels", default="3,4",
-                       help="Channels used instead when a patient has no valid "
-                            "reading on the primary pair anywhere in the file.")
+    group.add_argument("--sto2-channels", default="1",
+                       help="Cerebral-oximetry channel(s) used as the outcome "
+                            "(default 1). Averaging CH1 with CH2 mixes two "
+                            "sensors on different sides of the forehead, so "
+                            "the annotated outline asks for CH1 alone with "
+                            "CH2 kept back as a sensitivity. Give a "
+                            "comma-separated list to average several.")
+    group.add_argument("--sto2-fallback-channels", default="3",
+                       help="Channel(s) used instead when a patient has no "
+                            "valid reading on the primary one anywhere in "
+                            "their file (default 3).")
+    group.add_argument("--sto2-sensitivity-channels", default="2",
+                       help="The other sensor, used to repeat the whole "
+                            "analysis as a sensitivity (default 2). Empty "
+                            "string to skip that repeat.")
+    group.add_argument("--sto2-sensitivity-fallback", default="4",
+                       help="Fallback for the sensitivity sensor (default 4).")
     group.add_argument("--step-seconds", type=float, default=10.0,
                        help="Grid every signal is resampled onto (10 s).")
     group.add_argument("--max-gap-seconds", type=float, default=60.0,
@@ -384,6 +402,12 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--drug-window-minutes", type=float, default=5.0,
                        help="How long after a bolus a time point counts as "
                             "drug-disturbed (default 5 min).")
+    group.add_argument("--table1", action="store_true",
+                       help="Also write Table 1 (cohort characteristics and "
+                            "data coverage) as an image. Off by default: the "
+                            "coverage numbers still print to the terminal, "
+                            "and the annotated outline does not ask for the "
+                            "table as a deliverable.")
     group.add_argument("--adjust-drug-rates", action="store_true",
                        help="Put the running propofol and vasopressor "
                             "infusion rates into the models as covariates. "
@@ -3145,12 +3169,20 @@ def main() -> int:
           f"{int(events['induction'].notna().sum())}")
     print(f"  Resampled every {args.step_seconds:g} s, never interpolating "
           f"across gaps wider than {args.max_gap_seconds:g} s.")
+    many = "," in str(args.sto2_channels)
     print(f"  Kept: CO where CO_SQI >= {args.min_co_sqi:g}; MAP where "
-          f"databad == 0; PSi where the value is not '-'; cerebral O2 averaged "
-          f"over channels {args.sto2_channels} flagged valid"
-          + (f", falling back to {args.sto2_fallback_channels} for a patient "
-             f"with no valid reading on the primary pair."
-             if args.sto2_fallback_channels.strip() else "."))
+          f"databad == 0; PSi where the value is not '-'; cerebral O2 from "
+          + (f"the average of channels {args.sto2_channels}" if many
+             else f"channel {args.sto2_channels}")
+          + " where flagged valid"
+          + (f", falling back to channel {args.sto2_fallback_channels} for a "
+             f"patient with no valid reading on it anywhere."
+             if str(args.sto2_fallback_channels).strip() else "."))
+    if str(args.sto2_sensitivity_channels).strip():
+        print(f"  The other sensor (channel "
+              f"{args.sto2_sensitivity_channels}, fallback "
+              f"{args.sto2_sensitivity_fallback}) is not averaged in; the "
+              f"whole analysis is repeated on it as a sensitivity instead.")
     print("  No time window: every valid sample is used, over the whole stretch "
           "where MAP, cerebral O2 and PSi all exist."
           if args.min_minutes is None and args.max_minutes is None else
@@ -3312,7 +3344,7 @@ def main() -> int:
                   "MAP, so adjusting for its rate removes part of the "
                   "exposure itself"
                   + (f", and this rate moves within only {moving} of "
-                     "{patients_with} patients" if moving < patients_with / 3
+                     f"{patients_with} patients" if moving < patients_with / 3
                      else "")
                   + ". The adjusted fit is reported as a sensitivity instead.")
         elif share >= 0.8 and patients_with >= 10 and moving >= 5:
@@ -3547,25 +3579,29 @@ def main() -> int:
             table1.append((spec["label"], "not recorded"))
     table1.append(("Lag-1 residual autocorrelation",
                    f"{primary['fit'].rho1:.3f}"))
-    render_table(table1, [46, 40],
-                 "Table 1. Cohort characteristics, data coverage and "
-                 "distributions",
-                 "Numeric fields are median (IQR); categorical fields are n (%) "
-                 "of the analysed cohort. A count in brackets marks a field "
-                 "recorded for only some patients.\n"
-                 "Baseline characteristics come from the REDCap export and are "
-                 "patient-level, so the patient fixed effects absorb them; they "
-                 "describe the cohort rather than adjust the models.\n"
-                 "Grid: every signal resampled to a common clock per patient, "
-                 "never interpolated across a gap wider than "
-                 f"{args.max_gap_seconds:g} s. MAP kept where databad == 0; "
-                 f"PSi where the monitor did not write '-'; cerebral O2 "
-                 f"averaged over valid channels {args.sto2_channels} "
-                 f"(fallback {args.sto2_fallback_channels}); CO where CO_SQI "
-                 f">= {args.min_co_sqi:g}."
-                 + (f"\nNot available in this export: "
-                    f"{', '.join(baseline_missing)}." if baseline_missing else ""),
-                 args.outdir / "table1_data_coverage.png")
+    if not args.table1:
+        print("\n  Table 1 image not written (--table1 to produce it); the "
+              "coverage numbers above are the content.")
+    else:
+        render_table(table1, [46, 40],
+                     "Table 1. Cohort characteristics, data coverage and "
+                     "distributions",
+                     "Numeric fields are median (IQR); categorical fields are n (%) "
+                     "of the analysed cohort. A count in brackets marks a field "
+                     "recorded for only some patients.\n"
+                     "Baseline characteristics come from the REDCap export and are "
+                     "patient-level, so the patient fixed effects absorb them; they "
+                     "describe the cohort rather than adjust the models.\n"
+                     "Grid: every signal resampled to a common clock per patient, "
+                     "never interpolated across a gap wider than "
+                     f"{args.max_gap_seconds:g} s. MAP kept where databad == 0; "
+                     f"PSi where the monitor did not write '-'; cerebral O2 "
+                     f"averaged over valid channels {args.sto2_channels} "
+                     f"(fallback {args.sto2_fallback_channels}); CO where CO_SQI "
+                     f">= {args.min_co_sqi:g}."
+                     + (f"\nNot available in this export: "
+                        f"{', '.join(baseline_missing)}." if baseline_missing else ""),
+                     args.outdir / "table1_data_coverage.png")
 
     table2: list[tuple[str, ...]] = [
         ("Model / quantity", "Estimate", "95% CI", "P")]
@@ -3669,6 +3705,63 @@ def main() -> int:
                     continue
                 collected.append((f"CHANGE model, {minutes:g}-min horizon",
                                   new.contrast({rebuilt.terms["xm"]: gap})))
+
+        # The other oximetry sensor, end to end. Averaging CH1 with CH2 would
+        # mix two probes on different sides of the forehead; running the whole
+        # analysis again on CH2 asks the better question -- does the other
+        # sensor tell the same story? -- and that is a stronger check than
+        # averaging the two into one number that belongs to neither.
+        sensitivity_channels = str(args.sto2_sensitivity_channels).strip()
+        if sensitivity_channels:
+            banner(f"SENSITIVITY — repeated on cerebral-oximetry channel(s) "
+                   f"{sensitivity_channels}")
+            other = argparse.Namespace(**vars(args))
+            other.sto2_channels = sensitivity_channels
+            other.sto2_fallback_channels = str(args.sto2_sensitivity_fallback)
+            try:
+                alternative, _report, _skipped = build_aligned(
+                    other, events, map_list, hemo_list, covariate_list,
+                    medications)
+            except Exception as exc:
+                alternative = pd.DataFrame()
+                print(f"  Could not rebuild on those channels: {exc}")
+            if alternative.empty:
+                print("  No patient had usable data on that sensor.")
+            else:
+                print(f"  {alternative['subject_id'].nunique()} patients, "
+                      f"{len(alternative):,} time points on channel(s) "
+                      f"{sensitivity_channels}.")
+                for exposure, collected in (("map", map_variants),
+                                            ("co", co_variants)):
+                    if not collected:
+                        continue
+                    source = alternative
+                    if exposure == "co":
+                        if "co" not in alternative.columns:
+                            continue
+                        source = alternative.dropna(subset=["co"])
+                    if covariates:
+                        source = source.dropna(subset=list(covariates))
+                    if source.empty or source["subject_id"].nunique() < 3:
+                        continue
+                    rebuilt = build_design(source, exposure, "psi", centers,
+                                           covariates)
+                    new = fit_within(source, rebuilt.within,
+                                     f"channel {sensitivity_channels}",
+                                     step_minutes=args.step_seconds / 60.0)
+                    if not np.isfinite(new.params).all():
+                        continue
+                    gap = (AXES[exposure]["step"]
+                           * (representative[-1] - representative[0]))
+                    out = new.contrast({rebuilt.terms["xm"]: gap})
+                    out.update({"n_patients": new.n_patients,
+                                "n_obs": new.n_obs})
+                    collected.append(
+                        (f"cerebral O2 from channel {sensitivity_channels}",
+                         out))
+                    print(f"    {AXES[exposure]['short']}: "
+                          f"{format_estimate(out, 3)} "
+                          f"({new.n_patients} patients, {new.n_obs:,} points)")
 
         panels = [
             ("MAP x PSi — the difference between the MAP slope at "
