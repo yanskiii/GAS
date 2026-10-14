@@ -384,6 +384,16 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--drug-window-minutes", type=float, default=5.0,
                        help="How long after a bolus a time point counts as "
                             "drug-disturbed (default 5 min).")
+    group.add_argument("--adjust-drug-rates", action="store_true",
+                       help="Put the running propofol and vasopressor "
+                            "infusion rates into the models as covariates. "
+                            "OFF by default, and deliberately: a vasopressor "
+                            "raises MAP, so adjusting for it removes part of "
+                            "the very exposure being studied, and in this "
+                            "cohort the propofol rate varies within only a "
+                            "handful of patients. Both are reported as "
+                            "sensitivities either way, so the comparison is "
+                            "always available without making it the headline.")
     group.add_argument("--propofol-key", default="prop",
                        help="drug_key prefix for the hypnotic infusion whose "
                             "rate is used as the anesthetic exposure.")
@@ -436,6 +446,19 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--lag-minutes", default="1,2,5",
                        help="Lags, in minutes, by which the exposure is shifted "
                             "to precede the outcome (default 1,2,5).")
+    group.add_argument("--change-horizon", type=float, default=5.0,
+                       help="Horizon in minutes for the change model, which "
+                            "regresses the CHANGE in cerebral O2 on the "
+                            "CHANGE in the exposure over the same interval "
+                            "(default 5). Set 0 to skip it. Differencing "
+                            "removes the slow drift that leaves the levels "
+                            "model with a lag-1 residual autocorrelation near "
+                            "one, and asks the more clinical question: when "
+                            "pressure moved, did oxygenation follow?")
+    group.add_argument("--change-horizons", default="2,5,10",
+                       help="Horizons compared in the terminal and on the "
+                            "specification figure (default 2,5,10). The "
+                            "figure panels use --change-horizon.")
     group.add_argument("--maintenance-start", type=float, default=15.0,
                        help="Minutes after induction at which the maintenance "
                             "phase is taken to begin, for the maintenance-only "
@@ -762,10 +785,9 @@ def extract_characteristics(redcap: pd.DataFrame, subject_ids: pd.Series,
         if record_key is not None:
             # Each REDCap instrument writes its own row, so a field belongs to
             # the record rather than the row it happens to sit on.
-            grouped = redcap.groupby(record_key, sort=False)[column]
-            values = grouped.ffill()
-            values = redcap.assign(**{column: values}).groupby(
-                record_key, sort=False)[column].bfill()
+            key = redcap[record_key]
+            values = values.groupby(key, sort=False).ffill()
+            values = values.groupby(key, sort=False).bfill()
         columns[name] = values
 
     # "Past Medical History (choice=X)" arrives as one Checked/Unchecked column
@@ -784,10 +806,12 @@ def extract_characteristics(redcap: pd.DataFrame, subject_ids: pd.Series,
                 {column: redcap[column].notna() for column in history}
             ).any(axis=1)
             values = values.where(any_checked)
-            frame = redcap.assign(_count=values)
-            values = frame.groupby(record_key, sort=False)["_count"].ffill()
-            values = frame.assign(_count=values).groupby(
-                record_key, sort=False)["_count"].bfill()
+            # Group on the key directly rather than assigning a column into
+            # the (already very wide) export, which fragments it badly enough
+            # that pandas warns.
+            key = redcap[record_key]
+            values = values.groupby(key, sort=False).ffill()
+            values = values.groupby(key, sort=False).bfill()
         columns["comorbidities"] = values
 
     if not columns:
@@ -2087,6 +2111,61 @@ def lag_exposure(frame: pd.DataFrame, exposure: str, minutes: float,
     return out.drop(columns="_lagged")
 
 
+def difference_frame(frame: pd.DataFrame, horizon_minutes: float,
+                     step_minutes: float) -> pd.DataFrame:
+    """Recast the record as CHANGES over a fixed horizon instead of levels.
+
+    Why this exists. Regressing cerebral O2 on MAP in levels leaves residuals
+    whose lag-1 autocorrelation is 0.99: cerebral oxygenation drifts slowly
+    over hours, MAP wobbles on top of that drift, and a levels model spends
+    itself describing the drift. Almost none of the nominal sample size is
+    independent information, which is why the intervals come out so wide.
+
+    Differencing removes the drift by construction. What is left is the
+    question a clinician would actually ask -- when this patient's pressure
+    MOVED over the last few minutes, did their cerebral oxygenation move with
+    it, and does the answer depend on how deep they were?
+
+    The modifier is the average PSi across the window, because the depth that
+    matters is the depth the change happened at. Only intervals the record
+    genuinely spans are kept, so a difference is never taken across a gap.
+    """
+    shift = int(round(horizon_minutes / step_minutes))
+    if shift <= 0:
+        return frame
+    out = frame.sort_values(["subject_id", "minutes"]).copy()
+    grouped = out.groupby("subject_id", sort=False)
+
+    pieces: dict[str, pd.Series] = {"subject_id": out["subject_id"],
+                                    "minutes": out["minutes"]}
+    for column in ("map", "sto2", "co"):
+        if column in out.columns:
+            pieces[column] = grouped[column].diff(shift)
+    pieces["psi"] = (out["psi"] + grouped["psi"].shift(shift)) / 2.0
+    for column in ("propofol_rate", "pressor_rate", "bolus_hypnotic",
+                   "bolus_vasoactive"):
+        if column in out.columns:
+            pieces[column] = out[column]
+
+    elapsed = grouped["minutes"].diff(shift)
+    spans = np.isclose(elapsed, horizon_minutes, atol=step_minutes / 2)
+    delta = pd.DataFrame(pieces).loc[spans]
+    return delta.dropna(subset=["map", "sto2", "psi"])
+
+
+def change_axis(exposure: str, horizon: float) -> dict:
+    """Axis labelling for a model fitted on changes rather than levels."""
+    axis = dict(AXES[exposure])
+    short = AXES[exposure]["short"]
+    axis["label"] = (f"Change in {short} over {horizon:g} min "
+                     f"({AXES[exposure]['unit']})")
+    # Only `short` changes. Every caller already writes "<step_label> of
+    # <short>", so putting the word "change" into step_label as well would
+    # produce "per 10 mmHg of MAP change of MAP change".
+    axis["short"] = f"{short} change"
+    return axis
+
+
 def category_fit(frame: pd.DataFrame, exposure: str, step_minutes: float,
                  edges: tuple[float, ...] = PSI_CATEGORY_EDGES,
                  covariates: tuple[str, ...] = ()) -> tuple[Fit, list[dict]]:
@@ -2159,6 +2238,11 @@ def nonlinearity_fit(frame: pd.DataFrame, exposure: str, modifier: str,
     extended[f"{AXES[exposure]['short']}^2 (within)"] = x ** 2
     extended[f"{AXES[modifier]['short']}^2 (within)"] = m ** 2
     extended[f"{AXES[exposure]['short']}^2 x {AXES[modifier]['short']}"] = (x ** 2) * m
+    # The term that lets the SLOPE bend with depth. Without it a straight line
+    # in PSi is imposed, and a relationship that is flat across most of the PSi
+    # range and then reverses at the top -- which the category fit can show --
+    # would be averaged away into nothing.
+    extended[f"{AXES[exposure]['short']} x {AXES[modifier]['short']}^2"] = x * (m ** 2)
     fit = fit_within(frame, extended, "with quadratic terms",
                      step_minutes=step_minutes)
     return fit, design
@@ -2171,7 +2255,8 @@ def nonlinearity_fit(frame: pd.DataFrame, exposure: str, modifier: str,
 def make_marginal_figure(fit: Fit, design: Design, exposure: str, modifier: str,
                          frame: pd.DataFrame, representative: list[float],
                          output_path: Path, title: str,
-                         adjusted_for: tuple[str, ...]) -> None:
+                         adjusted_for: tuple[str, ...],
+                         axis_override: dict | None = None) -> None:
     """The outline's Figure 1 (and Figure 2): the exposure effect, by PSi.
 
     Panel A is the thing itself -- what the model says happens to cerebral O2
@@ -2188,7 +2273,7 @@ def make_marginal_figure(fit: Fit, design: Design, exposure: str, modifier: str,
     Panel C is the numbers the report quotes, as a forest: slope at each
     representative PSi, then the difference between the outermost two.
     """
-    axis = AXES[exposure]
+    axis = axis_override or AXES[exposure]
     step = axis["step"]
     deviation = design.within[design.terms["x"]].to_numpy(float)
     low, high = np.percentile(deviation, [2.5, 97.5])
@@ -2484,6 +2569,68 @@ def make_category_figure(rows: list[dict], exposure: str, output_path: Path,
     print(f"  wrote {output_path}")
 
 
+def make_specification_figure(panels: list[tuple[str, str, list[tuple[str, dict]]]],
+                              output_path: Path, title: str, note: str) -> None:
+    """Every specification's headline contrast on one axis.
+
+    A single estimate with an interval invites the reader to ask whether some
+    other reasonable choice would have given a different answer. This answers
+    that question directly instead of leaving it open: if the whole column sits
+    on one side of zero the result is robust to how it was fitted, and if it
+    straddles zero and wanders, the honest conclusion is that the data does not
+    settle the question -- which is itself worth showing rather than burying in
+    a sensitivity paragraph.
+    """
+    panels = [panel for panel in panels if panel[2]]
+    if not panels:
+        return
+    heights = [max(len(rows), 1) for _label, _unit, rows in panels]
+    # Size to the rows: one line each, plus a title and axis per panel and the
+    # caption at the top. Guessing leaves a page of white space between them.
+    total = 1.25 + 0.30 * sum(heights) + 0.85 * len(panels)
+    figure, axes = plt.subplots(
+        len(panels), 1, figsize=(11.5, total),
+        gridspec_kw={"height_ratios": heights})
+    if len(panels) == 1:
+        axes = [axes]
+
+    for axis, (label, unit, rows) in zip(axes, panels):
+        positions = np.arange(len(rows))[::-1]
+        for position, (name, result) in zip(positions, rows):
+            if not np.isfinite(result.get("estimate", np.nan)):
+                continue
+            crosses = not (np.isfinite(result.get("low", np.nan))
+                           and result["low"] * result["high"] > 0)
+            color = "#495057" if crosses else "#c00000"
+            weight = 2.0 if name.startswith("as reported") else 1.5
+            axis.plot([result["low"], result["high"]], [position, position],
+                      color=color, linewidth=weight)
+            axis.plot([result["estimate"]], [position], "o", color=color,
+                      markersize=7 if name.startswith("as reported") else 5.5)
+            axis.annotate(f"  {result['estimate']:+.3f} "
+                          f"[{result['low']:+.3f}, {result['high']:+.3f}]",
+                          (result["high"], position), fontsize=8,
+                          va="center", color=color)
+        axis.axvline(0, color="#c00000", linewidth=1.2, linestyle="--")
+        axis.set_yticks(positions)
+        axis.set_yticklabels([name for name, _result in rows], fontsize=9)
+        axis.set_ylim(-0.6, len(rows) - 0.4)
+        axis.set_xlabel(unit, fontsize=9)
+        axis.set_title(label, fontsize=11, loc="left")
+        axis.grid(alpha=0.18, axis="x")
+        span = axis.get_xlim()
+        axis.set_xlim(span[0], span[0] + (span[1] - span[0]) * 1.45)
+
+    figure.suptitle(f"{title}\n" + "\n".join(textwrap.wrap(note, 118)),
+                    fontsize=12.5, x=0.02, y=1.0 - 0.1 / total, ha="left",
+                    va="top")
+    figure.subplots_adjust(top=1.0 - 1.15 / total, bottom=0.55 / total,
+                           left=0.265, right=0.985, hspace=0.75 / total * 4)
+    figure.savefig(output_path, dpi=200)
+    plt.close(figure)
+    print(f"  wrote {output_path}")
+
+
 def render_table(rows: list[tuple[str, ...]], widths: list[int], title: str,
                  footnote: str, output_path: Path) -> None:
     """Draw a table as an image, so it can be attached next to the figures.
@@ -2613,9 +2760,10 @@ def characteristic_rows(characteristics: pd.DataFrame, subjects: list[str],
 def run_model(frame: pd.DataFrame, exposure: str, modifier: str,
               centers: dict[str, float], representative: list[float],
               covariates: tuple[str, ...], args: argparse.Namespace,
-              label: str) -> dict:
+              label: str, axis_override: dict | None = None,
+              brief: bool = False) -> dict:
     """Fit, print and collect one exposure's model. Figures are drawn by main."""
-    axis = AXES[exposure]
+    axis = axis_override or AXES[exposure]
     step = axis["step"]
     design = build_design(frame, exposure, modifier, centers, covariates)
     fit = fit_within(frame, design.within, label,
@@ -2647,22 +2795,25 @@ def run_model(frame: pd.DataFrame, exposure: str, modifier: str,
           f"per 10 PSi units")
 
     cross = fit.coefficient(design.terms["xb"])
-    print(f"\n  Cross-level term ({axis['short']} x the patient's MEAN PSi), "
-          f"reported separately so it cannot contaminate the one above:")
-    print(f"    {format_estimate(cross, 5)}  "
-          f"% cerebral O2 per {axis['unit']} per PSi unit of average depth")
-    print(f"    This asks a different question — whether patients who run "
-          f"deeper ON AVERAGE have a different {axis['short']} slope — and it "
-          f"is a between-patient comparison, so it is not the clinical "
-          f"estimate. Pooling the two into one coefficient, which writing the "
-          f"model with raw {axis['short']} x PSi would do, drags the estimate "
-          f"toward whichever is weaker.")
-    equality = fit.contrast({design.terms["xm"]: 1.0, design.terms["xb"]: -1.0})
-    print(f"    Difference between the two: {format_estimate(equality, 5)}"
-          + ("  — no evidence they differ, so a model that pooled them would "
-             "not have been badly wrong here."
-             if np.isfinite(equality["p"]) and equality["p"] >= 0.05 else
-             "  — they differ, so keeping them apart was necessary."))
+    if not brief:
+        print(f"\n  Cross-level term ({axis['short']} x the patient's MEAN "
+              f"PSi), reported separately so it cannot contaminate the one "
+              f"above:")
+        print(f"    {format_estimate(cross, 5)}  "
+              f"% cerebral O2 per {axis['unit']} per PSi unit of average depth")
+        print(f"    This asks a different question — whether patients who run "
+              f"deeper ON AVERAGE have a different {axis['short']} slope — and "
+              f"it is a between-patient comparison, so it is not the clinical "
+              f"estimate. Pooling the two into one coefficient, which writing "
+              f"the model with raw {axis['short']} x PSi would do, drags the "
+              f"estimate toward whichever is weaker.")
+        equality = fit.contrast({design.terms["xm"]: 1.0,
+                                 design.terms["xb"]: -1.0})
+        print(f"    Difference between the two: {format_estimate(equality, 5)}"
+              + ("  — no evidence they differ, so a model that pooled them "
+                 "would not have been badly wrong here."
+                 if np.isfinite(equality["p"]) and equality["p"] >= 0.05 else
+                 "  — they differ, so keeping them apart was necessary."))
 
     print(f"\n  Cerebral O2 change {axis['step_label']} of {axis['short']}, "
           f"at each representative PSi:")
@@ -2691,7 +2842,7 @@ def run_model(frame: pd.DataFrame, exposure: str, modifier: str,
               f"freedom above are {fit.dof}, not {fit.n_obs:,}.")
 
     mixed = None
-    if not args.no_mixed:
+    if not args.no_mixed and not brief:
         mixed = fit_mixed(design, frame, label + " (random effects)",
                           random_slope=args.random_slope)
         if mixed is None:
@@ -2718,6 +2869,19 @@ def run_model(frame: pd.DataFrame, exposure: str, modifier: str,
                   f"estimators of the same within-patient quantity, so "
                   f"closeness is the check that neither is being driven by its "
                   f"own assumptions.")
+            if np.isfinite(fit.rho1) and fit.rho1 > 0.8:
+                # A mixed model treats residuals as independent once the
+                # random effects are taken out. At this much autocorrelation
+                # that is simply false, and the price is paid entirely in the
+                # standard errors: the interval below can be an order of
+                # magnitude too narrow and its P value correspondingly tiny.
+                print(f"    !! DO NOT QUOTE THE INTERVAL ABOVE. With a lag-1 "
+                      f"residual autocorrelation of {fit.rho1:.3f}, this "
+                      f"model's assumption of independent residuals is badly "
+                      f"violated, so its standard errors are far too small "
+                      f"and its P value far too impressive. Only the point "
+                      f"estimate is informative here; the fixed-effects "
+                      f"interval, clustered on patient, is the one to report.")
             for column in design.between.columns:
                 print(f"    {column:<28} {format_estimate(mixed.coefficient(column), 4)}")
             print("    Those last rows are the between-patient comparisons. "
@@ -2747,8 +2911,13 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
     gap = step * (representative[-1] - representative[0])
     headline = {design.terms["xm"]: gap}
     lines: list[str] = []
+    # Every variant's headline contrast, kept so they can be drawn on one axis.
+    # With a null this unstable, the spread across specifications is more
+    # informative than any single one of them.
+    variants: list[tuple[str, dict]] = []
 
-    def refit(subset: pd.DataFrame, label: str) -> dict | None:
+    def refit(subset: pd.DataFrame, label: str,
+              record: str | None = None) -> dict | None:
         """Rebuild the design on the subset, so patient means are recomputed."""
         if subset.empty or subset["subject_id"].nunique() < 3:
             return None
@@ -2759,9 +2928,12 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
             return None
         out = new.contrast({rebuilt.terms["xm"]: gap})
         out.update({"n_patients": new.n_patients, "n_obs": new.n_obs})
+        if record:
+            variants.append((record, out))
         return out
 
     reference = fit.contrast(headline)
+    variants.append(("as reported (primary fit)", reference))
     print(f"\n  Reference, from the primary fit — the slope difference between "
           f"PSi {representative[0]:g} and PSi {representative[-1]:g}:")
     print(f"    {format_estimate(reference, 3)}  "
@@ -2774,7 +2946,8 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
     for minutes in [float(part) for part in str(args.thin_minutes).split(",")
                     if part.strip()]:
         thinned = thin(frame, minutes)
-        out = refit(thinned, f"thinned to {minutes:g} min")
+        out = refit(thinned, f"thinned to {minutes:g} min",
+                    record=f"thinned to 1 per {minutes:g} min")
         if out is None:
             print(f"    one sample per {minutes:g} min: not estimable")
             continue
@@ -2829,6 +3002,7 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
                                     args.step_seconds / 60.0, covariates)
     if np.isfinite(quadratic.params).all():
         out = quadratic.contrast(headline)
+        variants.append(("with quadratic terms", out))
         print(f"    slope difference {format_estimate(out, 3)}")
         curvature = quadratic.coefficient(
             f"{axis['short']}^2 x {AXES[modifier]['short']}")
@@ -2842,7 +3016,8 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
           f"after induction onward), so the induction transient cannot drive "
           f"the result:")
     maintenance = frame.loc[frame["minutes"] >= args.maintenance_start]
-    out = refit(maintenance, "maintenance only")
+    out = refit(maintenance, "maintenance only",
+                record=f"maintenance only (from {args.maintenance_start:g} min)")
     if out is None:
         print("    not estimable")
     else:
@@ -2856,7 +3031,8 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
     for minutes in [float(part) for part in str(args.lag_minutes).split(",")
                     if part.strip()]:
         lagged = lag_exposure(frame, exposure, minutes, args.step_seconds / 60.0)
-        out = refit(lagged, f"lag {minutes:g} min")
+        out = refit(lagged, f"lag {minutes:g} min",
+                    record=f"exposure lagged {minutes:g} min")
         if out is None:
             print(f"    {minutes:g} min lag: not estimable")
             continue
@@ -2875,7 +3051,8 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
                 disturbed |= frame[name].fillna(0).gt(0)
         quiet = frame.loc[~disturbed]
         share = float(disturbed.mean())
-        out = refit(quiet, "away from boluses")
+        out = refit(quiet, "away from boluses",
+                    record=f"excluding +/-{args.drug_window_minutes:g} min of a bolus")
         if out is None:
             print(f"    excluding the {share:.0%} of points within "
                   f"{args.drug_window_minutes:g} min of a bolus: not estimable")
@@ -2897,6 +3074,7 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
                                       "drug-rate adjusted",
                                       step_minutes=args.step_seconds / 60.0)
                 out = drug_fit.contrast({rebuilt.terms["xm"]: gap})
+                variants.append(("adjusted for the drug rates", out))
                 print(f"    adjusting for the running "
                       f"{' and '.join(COVARIATE_LABELS[name] for name in extra)}: "
                       f"{format_estimate(out, 3)} "
@@ -2911,6 +3089,7 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
         bare = fit_within(frame, plain.within, "unadjusted",
                           step_minutes=args.step_seconds / 60.0)
         out = bare.contrast({plain.terms["xm"]: gap})
+        variants.append(("without the drug-rate covariates", out))
         print(f"    unadjusted slope difference {format_estimate(out, 3)}")
     else:
         print("\n  Covariate comparison: not possible. No anesthesia-record "
@@ -2919,7 +3098,7 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
               "enable it.")
         lines.append("models are unadjusted for end-tidal CO2, inspired O2 "
                      "fraction and anesthetic concentration")
-    return lines
+    return lines, variants
 
 
 # --------------------------------------------------------------------------- #
@@ -3127,7 +3306,16 @@ def main() -> int:
         print(f"  {COVARIATE_LABELS[name]}: known for {share:.0%} of time "
               f"points over {patients_with} patients, and varies within "
               f"{moving} of them")
-        if share >= 0.8 and patients_with >= 10 and moving >= 5:
+        if not args.adjust_drug_rates:
+            print("    carried but NOT adjusted for (pass "
+                  "--adjust-drug-rates to change that). A vasopressor raises "
+                  "MAP, so adjusting for its rate removes part of the "
+                  "exposure itself"
+                  + (f", and this rate moves within only {moving} of "
+                     "{patients_with} patients" if moving < patients_with / 3
+                     else "")
+                  + ". The adjusted fit is reported as a sensitivity instead.")
+        elif share >= 0.8 and patients_with >= 10 and moving >= 5:
             covariates = covariates + (name,)
         else:
             print("    not used for adjustment: it needs >= 80% coverage, "
@@ -3205,6 +3393,42 @@ def main() -> int:
               "fixed asks whether flow matters beyond the pressure it "
               "generates. It is reported alongside, not instead.")
 
+    # ---- the change model ---------------------------------------------------
+    # Levels leave a lag-1 residual autocorrelation near 1: cerebral O2 drifts
+    # for hours and the model spends itself on the drift. Differencing removes
+    # it and asks the question a clinician would -- when pressure MOVED, did
+    # oxygenation move with it?
+    change_results: dict[str, dict] = {}
+    horizon = float(args.change_horizon)
+    if horizon > 0:
+        banner(f"CHANGE MODEL — does a change in MAP over {horizon:g} min move "
+               f"cerebral O2?")
+        changed = difference_frame(adjusted, horizon, args.step_seconds / 60.0)
+        if changed.empty or changed["subject_id"].nunique() < 3:
+            print("  Not enough continuous stretches of that length to form "
+                  "differences.")
+        else:
+            print(f"  {changed['subject_id'].nunique()} patients, "
+                  f"{len(changed):,} overlapping {horizon:g}-minute intervals.")
+            print("  Outcome is the change in cerebral O2 across the "
+                  "interval; exposure is the change in MAP across the same "
+                  "interval; PSi is its average over the interval.")
+            change_centers = dict(centers)
+            change_centers["map"] = 0.0
+            change_centers["co"] = 0.0
+            change_results["map"] = run_model(
+                changed, "map", "psi", change_centers, representative,
+                covariates, args, "dMAP x PSi",
+                axis_override=change_axis("map", horizon))
+            if "co" in changed.columns and changed["co"].notna().any():
+                co_changed = changed.dropna(subset=["co"])
+                if co_changed["subject_id"].nunique() >= 3:
+                    banner(f"CHANGE MODEL — cardiac output over {horizon:g} min")
+                    change_results["co"] = run_model(
+                        co_changed, "co", "psi", change_centers,
+                        representative, covariates, args, "dCO x PSi",
+                        axis_override=change_axis("co", horizon))
+
     # ---- figures ------------------------------------------------------------
     banner("Figures")
     make_marginal_figure(
@@ -3221,6 +3445,19 @@ def main() -> int:
             covariates)
     else:
         print("  figure2 skipped: no usable cardiac output.")
+
+    for exposure, number in (("map", 4), ("co", 5)):
+        result = change_results.get(exposure)
+        if result is None:
+            continue
+        label = AXES[exposure]["short"]
+        make_marginal_figure(
+            result["fit"], result["design"], exposure, "psi",
+            result["frame"], representative,
+            args.outdir / f"figure{number}_{exposure}_change_model.png",
+            f"Figure {number}. Does a CHANGE in {label} over {horizon:g} min "
+            f"move cerebral O2, and does PSi modify that?",
+            covariates, axis_override=change_axis(exposure, horizon))
 
     _category_fit, category_rows = category_fit(
         adjusted, "map", args.step_seconds / 60.0, PSI_CATEGORY_EDGES,
@@ -3388,20 +3625,87 @@ def main() -> int:
 
     # ---- sensitivity analyses ----------------------------------------------
     limitations: list[str] = []
+    panels: list[tuple[str, str, list[tuple[str, dict]]]] = []
     if args.quick:
         banner("Sensitivity analyses")
         print("  Skipped (--quick).")
     else:
         banner("SENSITIVITY — primary model (MAP exposure)")
-        limitations += run_sensitivities(primary, args, centers)
+        lines, map_variants = run_sensitivities(primary, args, centers)
+        limitations += lines
+        co_variants: list[tuple[str, dict]] = []
         if secondary is not None:
             banner("SENSITIVITY — secondary model (CO exposure)")
-            run_sensitivities(secondary, args, centers)
+            _lines, co_variants = run_sensitivities(secondary, args, centers)
+
+        # The change model at several horizons, on the same axis as the rest,
+        # so the levels and change framings can be read against each other.
+        for exposure, collected in (("map", map_variants), ("co", co_variants)):
+            if not collected:
+                continue
+            source = adjusted if exposure == "map" else (
+                secondary["frame"] if secondary is not None else None)
+            if source is None:
+                continue
+            step = AXES[exposure]["step"]
+            gap = step * (representative[-1] - representative[0])
+            for minutes in [float(part) for part
+                            in str(args.change_horizons).split(",")
+                            if part.strip()]:
+                shifted = difference_frame(source, minutes,
+                                           args.step_seconds / 60.0)
+                if exposure == "co":
+                    shifted = shifted.dropna(subset=["co"])
+                if shifted.empty or shifted["subject_id"].nunique() < 3:
+                    continue
+                change_centers = dict(centers)
+                change_centers[exposure] = 0.0
+                rebuilt = build_design(shifted, exposure, "psi",
+                                       change_centers, covariates)
+                new = fit_within(shifted, rebuilt.within,
+                                 f"change over {minutes:g} min",
+                                 step_minutes=args.step_seconds / 60.0)
+                if not np.isfinite(new.params).all():
+                    continue
+                collected.append((f"CHANGE model, {minutes:g}-min horizon",
+                                  new.contrast({rebuilt.terms["xm"]: gap})))
+
+        panels = [
+            ("MAP x PSi — the difference between the MAP slope at "
+             f"PSi {representative[0]:g} and at PSi {representative[-1]:g}",
+             "Cerebral O2 change (%) per 10 mmHg of MAP", map_variants),
+            ("CO x PSi — the same contrast with cardiac output",
+             "Cerebral O2 change (%) per 1 L/min of CO", co_variants)]
+        banner("Specification comparison")
+        make_specification_figure(
+            panels, args.outdir / "figure6_specification_comparison.png",
+            "Figure 6. Does the answer depend on how it was fitted?",
+            "Each row is the same headline contrast under a different "
+            "reasonable analytic choice. Red marks an interval that excludes "
+            "zero. A column that stays on one side of zero is a robust "
+            "result; one that straddles zero and wanders is a question this "
+            "data does not settle.")
 
     # ---- the summary the PI asked for first --------------------------------
     banner("Data coverage and model limitations — the paragraph to send")
     headline = primary["difference"]
-    direction = ("more positive" if headline["estimate"] < 0 else "less positive")
+    # Never state a direction as a finding when the interval spans zero. The
+    # sign of a null point estimate is noise, and this is the paragraph that
+    # gets pasted into an email.
+    if np.isfinite(headline["low"]) and headline["low"] * headline["high"] > 0:
+        verdict = ("the MAP slope is "
+                   + ("more" if headline["estimate"] < 0 else "less")
+                   + " positive at lower PSi, so\n  cerebral oxygenation is "
+                     "more pressure-passive when the patient is deeper.")
+    else:
+        worst = max(abs(headline["low"]), abs(headline["high"]))
+        verdict = (
+            "the interval spans zero, so there is NO EVIDENCE\n"
+            "  that PSi modifies the MAP-cerebral O2 relationship. Nor is this "
+            "evidence of absence:\n"
+            f"  a difference as large as {worst:.3f} % per 10 mmHg remains "
+            "compatible with the data,\n  and the sign of the point estimate "
+            "should not be read as a direction.")
     print(f"""  Cohort. {n_patients} patients contributed {len(aligned):,} time
   points on a {args.step_seconds:g}-second grid, a median of
   {duration.median():.0f} minutes per patient
@@ -3420,9 +3724,7 @@ def main() -> int:
   {primary['slopes'][representative[-1]]['estimate']:+.3f} %
   at PSi {representative[-1]:g}, a difference of
   {headline['estimate']:+.3f} % (95% CI {headline['low']:+.3f} to
-  {headline['high']:+.3f}, P {format_p(headline['p'])}) — the MAP slope is
-  {direction} at lower PSi, i.e. cerebral oxygenation behaves more
-  pressure-passively when the patient is deeper.""")
+  {headline['high']:+.3f}, P {format_p(headline['p'])}) — {verdict}""")
     if secondary is not None:
         print(f"""
   Secondary result. With cardiac output as the exposure on
@@ -3430,7 +3732,20 @@ def main() -> int:
   the CO x PSi interaction was
   {secondary['raw']['estimate']:+.5f} % per L/min per PSi unit
   (95% CI {secondary['raw']['low']:+.5f} to {secondary['raw']['high']:+.5f},
-  P {format_p(secondary['raw']['p'])}).""")
+  P {format_p(secondary['raw']['p'])}). The CO association ITSELF, however, is
+  the firmest thing in this analysis and should not be lost behind its null
+  interaction: cerebral O2 changed by
+  {secondary['slopes'][representative[0]]['estimate']:+.3f} % per 1 L/min at
+  PSi {representative[0]:g}
+  (95% CI {secondary['slopes'][representative[0]]['low']:+.3f} to
+  {secondary['slopes'][representative[0]]['high']:+.3f},
+  P {format_p(secondary['slopes'][representative[0]]['p'])}) and
+  {secondary['slopes'][representative[-1]]['estimate']:+.3f} % at
+  PSi {representative[-1]:g}
+  (95% CI {secondary['slopes'][representative[-1]]['low']:+.3f} to
+  {secondary['slopes'][representative[-1]]['high']:+.3f},
+  P {format_p(secondary['slopes'][representative[-1]]['p'])}) — a flow effect
+  several times the size of the pressure effect, at every depth.""")
 
     print("""
   Limitations, stated plainly.
@@ -3494,6 +3809,15 @@ def main() -> int:
         print("  figure2_co_cerebral_o2_by_psi.png     the secondary result")
     print("  figure3_map_slopes_by_psi_category.png  the categorical "
           "sensitivity, for readers who prefer bands")
+    for exposure, number in (("map", 4), ("co", 5)):
+        if exposure in change_results:
+            print(f"  figure{number}_{exposure}_change_model.png"
+                  + " " * (26 - len(exposure))
+                  + f"does a CHANGE in {AXES[exposure]['short']} move "
+                    f"cerebral O2? (drift removed)")
+    if panels and any(rows for _label, _unit, rows in panels):
+        print("  figure6_specification_comparison.png   whether the answer "
+              "survives every reasonable analytic choice")
     print("\n  The outline asks for the primary and secondary model results, "
           "Figures 1 and 2, and a coverage-and-limitations summary first. "
           "Those are the first four files above plus the paragraph printed "
