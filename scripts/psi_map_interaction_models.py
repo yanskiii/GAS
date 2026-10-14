@@ -307,11 +307,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Write beside the script, whatever folder it has been copied into. A
-    # hardcoded dated folder goes stale the moment the script is moved, and
-    # then the run quietly fills a directory nobody is looking at while the
-    # previous run's figures sit in the one that is open.
-    base = Path(__file__).resolve().parent
+    base = Path("/N/project/Analgesia_BDproject/PR/scripts_PR/10-14 Mixed Models")
     data = Path("/N/project/Analgesia_BDproject/PR/data")
 
     group = parser.add_argument_group("data sources")
@@ -351,9 +347,11 @@ def parse_args() -> argparse.Namespace:
                        help="REDCap labeled export, for induction, OR entry "
                             "and the Table 1 baseline characteristics.")
     group.add_argument("--outdir", type=Path, default=base / "output",
-                       help="Where the figures are written. Defaults to an "
-                            "'output' folder beside this script, so a run "
-                            "always lands next to the copy that produced it.")
+                       help="Where the figures are written. The resolved path "
+                            "is printed at the top of every run: if it is not "
+                            "the folder you are looking at, pass --outdir, "
+                            "because figures that land elsewhere look exactly "
+                            "like figures that did not change.")
 
     group = parser.add_argument_group("signal cleaning (same rules as the "
                                       "stratified scatter script)")
@@ -3130,6 +3128,16 @@ def run_sensitivities(result: dict, args: argparse.Namespace,
 def main() -> int:
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
+    # Say where the figures are going before anything else is printed. A run
+    # that quietly fills a different folder is indistinguishable, on screen,
+    # from a run that changed nothing -- which has already cost one round of
+    # confusion in this project.
+    existing = sorted(path.name for path in args.outdir.glob("*.png"))
+    print(f"\nFIGURES WILL BE WRITTEN TO:\n  {args.outdir.resolve()}")
+    if existing:
+        print(f"  ({len(existing)} PNG(s) already there will be overwritten: "
+              f"{', '.join(existing[:4])}"
+              + (" ..." if len(existing) > 4 else "") + ")")
 
     for path in (args.filepaths, args.sto2_filepaths, args.redcap):
         if not path.is_file():
