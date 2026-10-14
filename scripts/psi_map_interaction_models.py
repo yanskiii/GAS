@@ -3637,6 +3637,28 @@ def main() -> int:
             add_row(f"  difference, PSi {representative[-1]:g} vs "
                     f"{representative[0]:g}", secondary["difference"])
     table2.append(("", "", "", ""))
+    # The change model belongs in the table the PI reads, not only in the
+    # figures: it is where the drift stops dominating, so it carries more
+    # information per row than the levels fits above it.
+    for exposure in ("map", "co"):
+        result = change_results.get(exposure)
+        if result is None:
+            continue
+        unit = AXES[exposure]["unit"]
+        step = AXES[exposure]["step"]
+        table2.append(("", "", "", ""))
+        table2.append((f"CHANGE MODEL, {horizon:g}-min horizon: "
+                       f"{AXES[exposure]['short']} exposure", "", "", ""))
+        add_row(f"  d{AXES[exposure]['short']} x PSi, % per {unit} per PSi",
+                result["raw"], 5)
+        for psi in representative:
+            add_row(f"  % cerebral O2 per {step:g} {unit} of change at "
+                    f"PSi {psi:g}", result["slopes"][psi])
+        if result["difference"] is not None:
+            add_row(f"  difference, PSi {representative[-1]:g} vs "
+                    f"{representative[0]:g}", result["difference"])
+
+    table2.append(("", "", "", ""))
     table2.append(("PSi CATEGORIES: % cerebral O2 per 10 mmHg MAP", "", "", ""))
     for row in category_rows:
         add_row(f"  PSi {row['label']} "
@@ -3854,7 +3876,16 @@ def main() -> int:
     bootstrap and leave-one-patient-out checks address the same concern from
     three directions.
   * Association, not causation. MAP and PSi move together with surgical events,
-    drug boluses and position changes; none of this is randomized.""")
+    drug boluses and position changes; none of this is randomized.
+  * Many specifications, one dataset. The specification figure shows around a
+    dozen fits per exposure. They are not independent tests -- they reuse the
+    same patients -- so a row that clears P < 0.05 while its neighbours do not
+    is weak evidence, and picking it would be choosing the analysis after
+    seeing the answer. The figure is there to show whether an estimate is
+    STABLE across choices, not to be searched for the significant one. A
+    result worth reporting holds its sign and rough size across the column;
+    one that appears in a single row should be called hypothesis-generating
+    and tested on new patients.""")
     if medication_info:
         print("""  * Drugs move both variables at once. Propofol lowers MAP and PSi together,
     so "deep and hypotensive" can co-occur pharmacologically rather than
