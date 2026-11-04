@@ -131,15 +131,25 @@ INFUSION_COLUMNS: dict[str, str] = {
 
 PATIENT_ALIASES = ("screening_id", "patient_id", "subject_id", "patient",
                    "id", "record_id", "study_id")
-# Names that suggest minutes relative to induction, with how strongly.
-TIME_NAME_HINTS: tuple[tuple[str, int], ...] = (
-    ("minutesfrominduction", 100), ("minfrominduction", 100),
-    ("timefrominduction", 100), ("minutessinceinduction", 100),
-    ("timesinceinduction", 100), ("inductionmin", 95), ("timemin", 95),
-    ("relativeminutes", 90), ("elapsedmin", 90), ("minrel", 85),
-    ("timerel", 85), ("reltime", 85), ("tmin", 80), ("timeminutes", 80),
-    ("minutes", 60), ("elapsed", 50), ("epochmin", 70), ("minute", 55),
+# What the axis is measured from. Induction is the one the analysis window is
+# defined against; the others are real columns in this dataset and are offered
+# only if nothing better exists.
+TIME_ORIGIN_HINTS: tuple[tuple[str, int], ...] = (
+    ("induction", 100), ("intubation", 60), ("surgerystart", 50),
+    ("surgery", 45), ("incision", 45), ("anesthesiastart", 45),
 )
+
+# Generic names for a relative axis with no origin word in them.
+TIME_GENERIC_HINTS: tuple[tuple[str, int], ...] = (
+    ("timemin", 70), ("elapsed", 55), ("reltime", 55), ("timerel", 55),
+    ("tmin", 50), ("epochmin", 50), ("timeminutes", 60),
+)
+
+# Suffixes marking a working copy rather than the column to analyse. They lose
+# to the plain name so that 'seconds_from_induction' beats
+# 'seconds_from_induction_original'.
+TIME_VARIANT_SUFFIXES = ("original", "raw", "alt", "backup", "old", "prev",
+                         "med", "v1", "v2", "test", "tmp", "temp", "check")
 
 # Names that mean a wall clock, not an offset. A column called
 # 'timestamp_local' starts with 'time', which is exactly how a prefix match
@@ -199,18 +209,40 @@ def summarise_range(values: pd.Series) -> str:
     return f"{numeric.min():,.1f} to {numeric.max():,.1f}"
 
 
-def rank_time_columns(frame: pd.DataFrame) -> list[tuple[float, str, str]]:
-    """Score every column on how much it looks like minutes from induction.
+def time_unit_in_minutes(key: str) -> tuple[float, str] | None:
+    """How many minutes one unit of this column is, read off its name.
 
-    Name alone is not enough, which is how 'timestamp_local' gets chosen by a
-    prefix match on 'time'. A column earns its score from its name AND from
-    whether its values could be minutes around an induction: a microsecond
-    epoch clock reading 1.77e15 cannot be, whatever it is called.
-
-    Returns (score, column, description), best first. An empty list means
-    nothing in the file resembles a relative time axis.
+    A column called seconds_from_induction is the analysis axis; it is simply
+    not in minutes. Checking the range before the unit is what made an earlier
+    version reject it as 'too wide to be minutes', which was true and useless.
+    Order matters here: 'millisecond' contains 'second'.
     """
-    scored: list[tuple[float, str, str]] = []
+    if "millisecond" in key or "msec" in key:
+        return 1.0 / 60000.0, "milliseconds"
+    if "microsecond" in key or "usec" in key:
+        return 1.0 / 60000000.0, "microseconds"
+    if "second" in key or "secs" in key or "_sec" in key or key.endswith("sec"):
+        return 1.0 / 60.0, "seconds"
+    if "hour" in key or key.endswith("hr"):
+        return 60.0, "hours"
+    if "minute" in key or "min" in key:
+        return 1.0, "minutes"
+    return None
+
+
+def rank_time_columns(frame: pd.DataFrame) -> list[tuple]:
+    """Score every column on how much it looks like time relative to an event.
+
+    Three things have to line up, and an earlier version checked only the
+    first two. The NAME has to name an origin, which is how 'timestamp_local'
+    is ruled out. The name also has to give a UNIT, because the column may be
+    in seconds. Only then can the VALUES be checked, in minutes, against what
+    an induction window could plausibly span.
+
+    Returns (score, column, minutes_per_unit, unit_name, description), best
+    first.
+    """
+    scored: list[tuple] = []
     for column in frame.columns:
         key = normalize(column)
         if any(marker.replace("_", "") in key for marker in CLOCK_NAME_MARKERS):
@@ -221,25 +253,45 @@ def rank_time_columns(frame: pd.DataFrame) -> list[tuple[float, str, str]]:
         numeric = pd.to_numeric(series, errors="coerce").dropna()
         if numeric.empty or numeric.nunique() < 3:
             continue
-        low, high = float(numeric.min()), float(numeric.max())
+
+        unit = time_unit_in_minutes(key)
+        score = 0.0
+        for hint, weight in TIME_ORIGIN_HINTS:
+            if hint in key:
+                score = max(score, float(weight))
+        if score == 0.0:
+            for hint, weight in TIME_GENERIC_HINTS:
+                if key == hint:
+                    score = max(score, weight + 20.0)
+                elif hint in key:
+                    score = max(score, float(weight))
+        if score == 0.0:
+            continue
+        if unit is None:
+            # An origin but no unit named: assume minutes, and prefer anything
+            # that does say.
+            unit, score = (1.0, "minutes (assumed)"), score - 15.0
+        minutes_per_unit, unit_name = unit
+
+        low = float(numeric.min()) * minutes_per_unit
+        high = float(numeric.max()) * minutes_per_unit
         if not (TIME_PLAUSIBLE_LOW <= low and high <= TIME_PLAUSIBLE_HIGH):
             continue
 
-        score = 0.0
-        for hint, weight in TIME_NAME_HINTS:
-            if key == hint:
-                score = max(score, weight + 20)
-            elif hint in key:
-                score = max(score, float(weight))
-        if score == 0.0:
-            continue
-        # A real induction axis spans zero and covers the first few minutes.
+        # A working copy loses to the plain name it was copied from.
+        if any(key.endswith(suffix) for suffix in TIME_VARIANT_SUFFIXES):
+            score -= 30.0
+        # A real induction axis spans zero and reaches into the window.
         if low <= 0.0 <= high:
-            score += 25
+            score += 25.0
         if low <= 0.0 and high >= 10.0:
-            score += 15
-        scored.append((score, str(column),
-                       f"range {low:,.1f} to {high:,.1f}"))
+            score += 15.0
+
+        description = (f"{low:,.1f} to {high:,.1f} min"
+                       + (f", from {unit_name}" if minutes_per_unit != 1.0
+                          else ""))
+        scored.append((score, str(column), minutes_per_unit, unit_name,
+                       description))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return scored
 
@@ -444,7 +496,10 @@ class Schema:
         self.infusions: dict[str, str] = {}
         self.comorbidities: list[str] = []
         self.absent: list[str] = []
-        self.time_candidates: list[tuple[float, str, str]] = []
+        self.time_candidates: list[tuple] = []
+        # Minutes per unit of the time column, and what that unit is called.
+        self.time_scale: float = 1.0
+        self.time_unit: str = "minutes"
 
 
 def resolve_schema(frame: pd.DataFrame, args: argparse.Namespace) -> Schema:
@@ -474,10 +529,19 @@ def resolve_schema(frame: pd.DataFrame, args: argparse.Namespace) -> Schema:
                    or "  (none found)") + "\n")
             raise SystemExit(2)
         schema.time = found
+        unit = time_unit_in_minutes(normalize(found))
+        if args.time_units:
+            named = {"minutes": (1.0, "minutes"), "seconds": (1.0 / 60.0, "seconds"),
+                     "milliseconds": (1.0 / 60000.0, "milliseconds"),
+                     "hours": (60.0, "hours")}
+            unit = named[args.time_units]
+        if unit is not None:
+            schema.time_scale, schema.time_unit = unit
     else:
         ranked = rank_time_columns(frame)
-        schema.time = ranked[0][1] if ranked else None
         schema.time_candidates = ranked
+        if ranked:
+            _, schema.time, schema.time_scale, schema.time_unit, _ = ranked[0]
 
     for key, aliases in PHYSIOLOGY_ALIASES.items():
         found = find_column(frame, key, aliases)
@@ -533,7 +597,10 @@ def describe_schema(frame: pd.DataFrame, schema: Schema, path: Path) -> None:
         times = pd.to_numeric(frame[schema.time], errors="coerce")
         print(f"  time column    : {schema.time} "
               f"({times.min():.1f} to {times.max():.1f})")
-        for score, column, note in schema.time_candidates[1:4]:
+        if schema.time_scale != 1.0:
+            print(f"                   stored in {schema.time_unit}, "
+                  f"converted to minutes")
+        for score, column, _scale, _unit, note in schema.time_candidates[1:5]:
             print(f"                   also considered: {column} "
                   f"({note}, score {score:.0f})")
 
@@ -801,6 +868,11 @@ def parse_args() -> argparse.Namespace:
                         help="end of the analysis window")
     parser.add_argument("--baseline-start", type=float, default=-5.0,
                         help="start of the pre-induction baseline window")
+    parser.add_argument("--time-units", default=None,
+                        choices=("minutes", "seconds", "milliseconds",
+                                 "hours"),
+                        help="units of --time-col; read from its name when "
+                             "not given")
     parser.add_argument("--derive-minutes-from", default=None,
                         metavar="CLOCK_COLUMN",
                         help="build a minutes axis from a wall-clock column "
@@ -899,7 +971,20 @@ def main() -> int:
                        if args.no_window else
                        "the whole file; no relative time column was found")
     else:
-        frame[schema.time] = pd.to_numeric(frame[schema.time], errors="coerce")
+        values = pd.to_numeric(frame[schema.time], errors="coerce")
+        if schema.time_scale != 1.0:
+            # The column is in seconds, or some other unit. Convert once, into
+            # a new column, so the window and the baseline are both in minutes
+            # and the original stays untouched.
+            source = schema.time
+            frame["time_min"] = values * schema.time_scale
+            schema.time = "time_min"
+            print(f"\n  Time axis: '{source}' is in {schema.time_unit}, "
+                  f"converted to minutes\n"
+                  f"  ({frame['time_min'].min():.1f} to "
+                  f"{frame['time_min'].max():.1f} min).")
+        else:
+            frame[schema.time] = values
         window = frame.loc[frame[schema.time].between(args.window_start,
                                                       args.window_end)].copy()
         window_note = (f"{args.window_start:g} to {args.window_end:g} minutes "
