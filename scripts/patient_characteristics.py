@@ -154,6 +154,10 @@ TIME_GENERIC_HINTS: tuple[tuple[str, int], ...] = (
 TIME_VARIANT_SUFFIXES = ("original", "raw", "alt", "backup", "old", "prev",
                          "med", "v1", "v2", "test", "tmp", "temp", "check")
 
+# Words that mark a per-patient correction rather than a time axis.
+TIME_NOT_AN_AXIS = ("shift", "offset", "correction", "adjust", "delta",
+                    "duration", "length", "total")
+
 # Names that mean a wall clock, not an offset. A column called
 # 'timestamp_local' starts with 'time', which is exactly how a prefix match
 # picks a microsecond epoch clock and then reports that no epoch lies between
@@ -233,14 +237,20 @@ def time_unit_in_minutes(key: str) -> tuple[float, str] | None:
     return None
 
 
-def rank_time_columns(frame: pd.DataFrame) -> list[tuple]:
+def rank_time_columns(frame: pd.DataFrame,
+                      patient: str | None = None) -> list[tuple]:
     """Score every column on how much it looks like time relative to an event.
 
-    Three things have to line up, and an earlier version checked only the
-    first two. The NAME has to name an origin, which is how 'timestamp_local'
-    is ruled out. The name also has to give a UNIT, because the column may be
-    in seconds. Only then can the VALUES be checked, in minutes, against what
-    an induction window could plausibly span.
+    Four things have to line up. The NAME has to name an origin, which is how
+    'timestamp_local' is ruled out. The name also has to give a UNIT, because
+    the column may be in seconds. The VALUES, once converted to minutes, have
+    to span something an induction window could. And the column has to MOVE
+    WITHIN each patient, which is the test that matters most and was the last
+    one added: a per-patient constant such as 'induction_time_shift_seconds'
+    passes the first three easily and is not a time axis at all. Taking one as
+    the axis silently keeps every epoch of the patients whose constant falls
+    inside the window and drops the rest whole, which looks like a successful
+    run and is not one.
 
     Returns (score, column, minutes_per_unit, unit_name, description), best
     first.
@@ -281,9 +291,24 @@ def rank_time_columns(frame: pd.DataFrame) -> list[tuple]:
         if not (TIME_PLAUSIBLE_LOW <= low and high <= TIME_PLAUSIBLE_HIGH):
             continue
 
+        # Does it actually advance within a patient? A shift, an offset or a
+        # correction is one number per patient and must never be taken as the
+        # axis, however well its name and range read.
+        if patient is not None and patient in frame.columns:
+            ids = frame[patient]
+            if isinstance(ids, pd.DataFrame):
+                ids = ids.iloc[:, 0]
+            keep = ids.isin(pd.Index(ids.dropna().unique()[:12])).to_numpy()
+            inside = pd.to_numeric(frame[column], errors="coerce")[keep]
+            per_patient = inside.groupby(ids[keep].to_numpy()).nunique()
+            if per_patient.empty or float(per_patient.median()) < 5.0:
+                continue
+
         # A working copy loses to the plain name it was copied from.
         if any(key.endswith(suffix) for suffix in TIME_VARIANT_SUFFIXES):
             score -= 30.0
+        if any(word in key for word in TIME_NOT_AN_AXIS):
+            score -= 60.0
         # A real induction axis spans zero and reaches into the window.
         if low <= 0.0 <= high:
             score += 25.0
@@ -294,9 +319,12 @@ def rank_time_columns(frame: pd.DataFrame) -> list[tuple]:
                        + (f", from {unit_name}" if minutes_per_unit != 1.0
                           else ""))
         scored.append((score, str(column), minutes_per_unit, unit_name,
-                       description))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return scored
+                       description, high - low))
+    # Ties break on the wider span, not on the name. Two induction columns
+    # scored equally and the alphabetically earlier one won, which is how a
+    # 12-minute constant beat a 62-minute axis.
+    scored.sort(key=lambda item: (-item[0], -item[5], item[1]))
+    return [item[:5] for item in scored]
 
 
 def numeric_column_report(frame: pd.DataFrame, patient: str | None = None,
@@ -541,7 +569,7 @@ def resolve_schema(frame: pd.DataFrame, args: argparse.Namespace) -> Schema:
         if unit is not None:
             schema.time_scale, schema.time_unit = unit
     else:
-        ranked = rank_time_columns(frame)
+        ranked = rank_time_columns(frame, patient)
         schema.time_candidates = ranked
         if ranked:
             _, schema.time, schema.time_scale, schema.time_unit, _ = ranked[0]
