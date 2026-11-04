@@ -131,9 +131,26 @@ INFUSION_COLUMNS: dict[str, str] = {
 
 PATIENT_ALIASES = ("screening_id", "patient_id", "subject_id", "patient",
                    "id", "record_id", "study_id")
-TIME_ALIASES = ("time_min", "minutes", "time_minutes", "min_from_induction",
-                "time_from_induction", "minutes_from_induction", "t_min",
-                "elapsed_min", "time")
+# Names that suggest minutes relative to induction, with how strongly.
+TIME_NAME_HINTS: tuple[tuple[str, int], ...] = (
+    ("minutesfrominduction", 100), ("minfrominduction", 100),
+    ("timefrominduction", 100), ("minutessinceinduction", 100),
+    ("timesinceinduction", 100), ("inductionmin", 95), ("timemin", 95),
+    ("relativeminutes", 90), ("elapsedmin", 90), ("minrel", 85),
+    ("timerel", 85), ("reltime", 85), ("tmin", 80), ("timeminutes", 80),
+    ("minutes", 60), ("elapsed", 50), ("epochmin", 70), ("minute", 55),
+)
+
+# Names that mean a wall clock, not an offset. A column called
+# 'timestamp_local' starts with 'time', which is exactly how a prefix match
+# picks a microsecond epoch clock and then reports that no epoch lies between
+# 0 and 15 minutes. These are refused outright.
+CLOCK_NAME_MARKERS = ("timestamp", "unix", "epoch_time", "utc", "datetime",
+                      "date", "clock", "wall", "_local", "localtime")
+
+# A relative-minute column has to fall in a believable range. Induction
+# windows are minutes, not days; anything wider than this is a clock.
+TIME_PLAUSIBLE_LOW, TIME_PLAUSIBLE_HIGH = -720.0, 2880.0
 
 # Prefixes marking a recorded history item, stripped for display.
 HISTORY_PREFIXES = ("pmh_", "hx_", "comorbid_", "history_", "cc_")
@@ -173,6 +190,131 @@ def find_column(frame: pd.DataFrame, wanted: str,
             if normalized.startswith(key):
                 return column
     return None
+
+
+def summarise_range(values: pd.Series) -> str:
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty:
+        return "no numeric values"
+    return f"{numeric.min():,.1f} to {numeric.max():,.1f}"
+
+
+def rank_time_columns(frame: pd.DataFrame) -> list[tuple[float, str, str]]:
+    """Score every column on how much it looks like minutes from induction.
+
+    Name alone is not enough, which is how 'timestamp_local' gets chosen by a
+    prefix match on 'time'. A column earns its score from its name AND from
+    whether its values could be minutes around an induction: a microsecond
+    epoch clock reading 1.77e15 cannot be, whatever it is called.
+
+    Returns (score, column, description), best first. An empty list means
+    nothing in the file resembles a relative time axis.
+    """
+    scored: list[tuple[float, str, str]] = []
+    for column in frame.columns:
+        key = normalize(column)
+        if any(marker.replace("_", "") in key for marker in CLOCK_NAME_MARKERS):
+            continue
+        series = frame[column]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            continue
+        numeric = pd.to_numeric(series, errors="coerce").dropna()
+        if numeric.empty or numeric.nunique() < 3:
+            continue
+        low, high = float(numeric.min()), float(numeric.max())
+        if not (TIME_PLAUSIBLE_LOW <= low and high <= TIME_PLAUSIBLE_HIGH):
+            continue
+
+        score = 0.0
+        for hint, weight in TIME_NAME_HINTS:
+            if key == hint:
+                score = max(score, weight + 20)
+            elif hint in key:
+                score = max(score, float(weight))
+        if score == 0.0:
+            continue
+        # A real induction axis spans zero and covers the first few minutes.
+        if low <= 0.0 <= high:
+            score += 25
+        if low <= 0.0 and high >= 10.0:
+            score += 15
+        scored.append((score, str(column),
+                       f"range {low:,.1f} to {high:,.1f}"))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return scored
+
+
+def numeric_column_report(frame: pd.DataFrame, patient: str | None = None,
+                          limit: int = 12) -> list[str]:
+    """Columns that could be a time axis, with why each one is or is not.
+
+    Listing every numeric column is no help — a file has dozens, and MAP in
+    mmHg has the same range as minutes. A time axis has a signature: it rises
+    as the recording goes on, so within one patient it never goes backwards.
+    That is what this looks for, and it reports the clock columns too, with
+    their ranges, so it is clear why they were passed over.
+    """
+    lines: list[str] = []
+    rising: list[tuple[str, str]] = []
+    clocks: list[tuple[str, str]] = []
+
+    for column in frame.columns:
+        name = str(column)
+        key = normalize(column)
+        series = frame[column]
+        looks_timeish = any(word in key for word in
+                            ("time", "min", "clock", "stamp", "elapsed",
+                             "sec", "epoch"))
+        if pd.api.types.is_datetime64_any_dtype(series):
+            if looks_timeish:
+                clocks.append((name, "datetime, not an offset in minutes"))
+            continue
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.notna().sum() < 3 or numeric.nunique() < 3:
+            continue
+        low, high = float(numeric.min()), float(numeric.max())
+        span = f"range {low:,.1f} to {high:,.1f}"
+
+        if not (TIME_PLAUSIBLE_LOW <= low and high <= TIME_PLAUSIBLE_HIGH):
+            if looks_timeish:
+                clocks.append((name, f"{span} — too wide to be minutes"))
+            continue
+        # Known medication and covariate columns are not the time axis, and a
+        # cumulative dose rises within a patient exactly like a clock does.
+        if (key in {normalize(c) for c in BOLUS_COLUMNS}
+                or key in {normalize(c) for c in INFUSION_COLUMNS}
+                or key in {normalize(c) for c in PATIENT_NUMERIC}
+                or key in {normalize(c) for c in PATIENT_CATEGORICAL}):
+            continue
+
+        # A time axis rises within every patient AND takes many values there.
+        # That second half is what rules out age, which never moves, and a
+        # cumulative bolus, which moves once and then holds.
+        if patient is not None and patient in frame.columns:
+            sample = frame[[patient, column]].dropna()
+            ids = sample[patient].drop_duplicates().head(12)
+            sample = sample[sample[patient].isin(ids)]
+            if sample.empty:
+                continue
+            grouped = sample.groupby(patient)[column]
+            rises = bool(grouped.apply(lambda s: s.is_monotonic_increasing).all())
+            varies = float(grouped.nunique().median()) >= 10.0
+            if not (rises and varies):
+                continue
+        elif not looks_timeish:
+            continue
+        rising.append((name, span))
+
+    if rising:
+        lines.append("  Rises steadily within each patient, so it could be "
+                     "the time axis:")
+        for name, span in rising[:limit]:
+            lines.append(f"    {name:<38} {span}")
+    if clocks:
+        lines.append("  Time-like but not an offset in minutes, so not used:")
+        for name, why in clocks[:limit]:
+            lines.append(f"    {name:<38} {why}")
+    return lines
 
 
 def pretty_label(column: object) -> str:
@@ -244,6 +386,7 @@ class Schema:
         self.infusions: dict[str, str] = {}
         self.comorbidities: list[str] = []
         self.absent: list[str] = []
+        self.time_candidates: list[tuple[float, str, str]] = []
 
 
 def resolve_schema(frame: pd.DataFrame, args: argparse.Namespace) -> Schema:
@@ -260,7 +403,23 @@ def resolve_schema(frame: pd.DataFrame, args: argparse.Namespace) -> Schema:
             + "\n  ".join(str(c) for c in frame.columns[:80]) + "\n")
         raise SystemExit(2)
     schema.patient = patient
-    schema.time = find_column(frame, args.time_col, TIME_ALIASES)
+
+    if args.time_col:
+        # The user named one. Use it, or say plainly that it is not there.
+        found = find_column(frame, args.time_col)
+        if found is None:
+            sys.stderr.write(
+                f"\n--time-col '{args.time_col}' is not a column in this "
+                f"file.\n\nColumns whose values could be minutes from "
+                f"induction:\n"
+                + ("\n".join(numeric_column_report(frame, patient))
+                   or "  (none found)") + "\n")
+            raise SystemExit(2)
+        schema.time = found
+    else:
+        ranked = rank_time_columns(frame)
+        schema.time = ranked[0][1] if ranked else None
+        schema.time_candidates = ranked
 
     for key, aliases in PHYSIOLOGY_ALIASES.items():
         found = find_column(frame, key, aliases)
@@ -307,10 +466,18 @@ def describe_schema(frame: pd.DataFrame, schema: Schema, path: Path) -> None:
     if schema.time is None:
         print("  time column    : NOT FOUND — the whole file is treated as "
               "one window and there is no baseline section")
+        print("\n  Columns whose values could be minutes from induction:")
+        for line in (numeric_column_report(frame, schema.patient)
+                     or ["  (none found)"]):
+            print(f"  {line}")
+        print("  Pass the right one with --time-col.")
     else:
         times = pd.to_numeric(frame[schema.time], errors="coerce")
         print(f"  time column    : {schema.time} "
               f"({times.min():.1f} to {times.max():.1f})")
+        for score, column, note in schema.time_candidates[1:4]:
+            print(f"                   also considered: {column} "
+                  f"({note}, score {score:.0f})")
 
     def show(title: str, found: dict[str, str]) -> None:
         print(f"\n  {title}:")
@@ -566,7 +733,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR,
                         help="where the CSV and PNG are written")
     parser.add_argument("--patient-col", default="screening_id")
-    parser.add_argument("--time-col", default="time_min")
+    parser.add_argument("--time-col", default=None,
+                        help="minutes from induction; auto-detected by name "
+                             "and value range when not given")
     parser.add_argument("--window-start", type=float, default=0.0,
                         help="start of the analysis window, minutes from "
                              "induction")
@@ -574,6 +743,8 @@ def parse_args() -> argparse.Namespace:
                         help="end of the analysis window")
     parser.add_argument("--baseline-start", type=float, default=-5.0,
                         help="start of the pre-induction baseline window")
+    parser.add_argument("--no-window", action="store_true",
+                        help="summarise every row, ignoring the time window")
     parser.add_argument("--show-empty-comorbidities", action="store_true",
                         help="keep history rows that no patient has")
     parser.add_argument("--inspect", action="store_true",
@@ -603,12 +774,25 @@ def main() -> int:
     print(f"\nTABLE 1 WILL BE WRITTEN TO:\n  {args.outdir.resolve()}")
     print(f"Reading: {args.data}")
 
+    if args.no_window and schema.time is not None:
+        print(f"\n  --no-window: every row is summarised and the time column "
+              f"'{schema.time}' is ignored.")
+        schema.time = None
+
     if schema.time is None:
-        print("\n  No time column found, so the whole file is treated as the "
-              "analysis window\n  and there is no baseline section. Pass "
-              "--time-col if the file does have one.")
+        if not args.no_window:
+            print("\n  No column in this file looks like minutes from "
+                  "induction, so the whole file\n  is treated as the analysis "
+                  "window and there is no baseline section.")
+            for line in numeric_column_report(frame, schema.patient):
+                print(f"  {line}")
+            print("  If one of those is the right column, name it with "
+                  "--time-col; otherwise\n  pass --no-window to say so "
+                  "deliberately and silence this notice.")
         window = frame
-        window_note = "the whole file; no time column was found"
+        window_note = ("every row in the file; no analysis window was applied"
+                       if args.no_window else
+                       "the whole file; no relative time column was found")
     else:
         frame[schema.time] = pd.to_numeric(frame[schema.time], errors="coerce")
         window = frame.loc[frame[schema.time].between(args.window_start,
@@ -618,11 +802,19 @@ def main() -> int:
         if window.empty:
             sys.stderr.write(
                 f"\nNo epochs fall between {args.window_start:g} and "
-                f"{args.window_end:g} on column '{schema.time}', whose range "
-                f"is {frame[schema.time].min():.1f} to "
-                f"{frame[schema.time].max():.1f}.\n"
-                "If that column is in seconds rather than minutes, set "
-                "--window-end accordingly or pass the right --time-col.\n")
+                f"{args.window_end:g} minutes on column '{schema.time}', "
+                f"whose range is {frame[schema.time].min():,.1f} to "
+                f"{frame[schema.time].max():,.1f}.\n"
+                "That range is not minutes around an induction, so this is "
+                "the wrong column.\n\n"
+                "Columns whose values could be minutes from induction:\n"
+                + ("\n".join(numeric_column_report(frame, schema.patient))
+                   or "  (none in this file)")
+                + f"\n\nRe-run naming the right one:\n"
+                  f"  python {Path(__file__).name} --time-col <column>\n"
+                  f"\nOr, if the file truly has no relative time axis, "
+                  f"summarise all of it:\n"
+                  f"  python {Path(__file__).name} --no-window\n")
             return 1
 
     print(f"\n  Window: {window_note}")
