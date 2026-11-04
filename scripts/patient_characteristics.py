@@ -62,7 +62,9 @@ DEFAULT_DATA = Path(
     "lmm_model/lmm_analysis_df_processed.parquet")
 
 # Where the two files land, unless --outdir says otherwise.
-DEFAULT_OUTDIR = Path(__file__).resolve().parent / "output"
+DEFAULT_OUTDIR = Path(
+    "/N/project/Analgesia_BDproject/PR/scripts_PR/"
+    "StO2 LMM with meds/Output")
 
 
 # --------------------------------------------------------------------------- #
