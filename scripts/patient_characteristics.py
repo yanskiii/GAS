@@ -258,10 +258,20 @@ def numeric_column_report(frame: pd.DataFrame, patient: str | None = None,
     rising: list[tuple[str, str]] = []
     clocks: list[tuple[str, str]] = []
 
+    seen: set[str] = set()
     for column in frame.columns:
         name = str(column)
         key = normalize(column)
+        # The identifier is not the time axis, and asking for it alongside
+        # itself would build a two-column frame with one label twice.
+        if patient is not None and name == str(patient):
+            continue
+        if name in seen:                 # a file may repeat a column name
+            continue
+        seen.add(name)
         series = frame[column]
+        if isinstance(series, pd.DataFrame):
+            continue
         looks_timeish = any(word in key for word in
                             ("time", "min", "clock", "stamp", "elapsed",
                              "sec", "epoch"))
@@ -291,13 +301,16 @@ def numeric_column_report(frame: pd.DataFrame, patient: str | None = None,
         # That second half is what rules out age, which never moves, and a
         # cumulative bolus, which moves once and then holds.
         if patient is not None and patient in frame.columns:
-            sample = frame[[patient, column]].dropna()
-            ids = sample[patient].drop_duplicates().head(12)
-            sample = sample[sample[patient].isin(ids)]
-            if sample.empty:
+            ids = frame[patient]
+            if isinstance(ids, pd.DataFrame):      # repeated column label
+                ids = ids.iloc[:, 0]
+            keep = ids.isin(pd.Index(ids.dropna().unique()[:12]))
+            grouped = numeric[keep.to_numpy()].groupby(
+                ids[keep.to_numpy()].to_numpy())
+            if grouped.ngroups == 0:
                 continue
-            grouped = sample.groupby(patient)[column]
-            rises = bool(grouped.apply(lambda s: s.is_monotonic_increasing).all())
+            rises = bool(grouped.apply(
+                lambda s: s.dropna().is_monotonic_increasing).all())
             varies = float(grouped.nunique().median()) >= 10.0
             if not (rises and varies):
                 continue
@@ -315,6 +328,51 @@ def numeric_column_report(frame: pd.DataFrame, patient: str | None = None,
         for name, why in clocks[:limit]:
             lines.append(f"    {name:<38} {why}")
     return lines
+
+
+def clock_to_seconds(series: pd.Series) -> tuple[pd.Series, str]:
+    """Read a wall clock as seconds, whatever resolution it was stored in.
+
+    A timestamp arrives as a datetime, or as an integer count since 1970 in
+    seconds, milliseconds, microseconds or nanoseconds. Which one is decided
+    by magnitude, because a count of seconds in this decade is about 1.8e9 and
+    each finer unit multiplies that by a thousand.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series.astype("int64") / 1e9, "datetime"
+    numeric = pd.to_numeric(series, errors="coerce")
+    typical = float(numeric.abs().median()) if numeric.notna().any() else 0.0
+    if typical > 1e17:
+        return numeric / 1e9, "nanoseconds since 1970"
+    if typical > 1e14:
+        return numeric / 1e6, "microseconds since 1970"
+    if typical > 1e11:
+        return numeric / 1e3, "milliseconds since 1970"
+    return numeric.astype(float), "seconds"
+
+
+def derive_minutes(frame: pd.DataFrame, clock_column: str, patient: str,
+                   induction_column: str | None) -> tuple[pd.Series, str]:
+    """Minutes from an origin, built from a wall clock.
+
+    The origin is the induction timestamp when the file carries one. When it
+    does not, it is each patient's own first epoch, and the result is minutes
+    from the start of that patient's recording — which is the same thing only
+    if the recording starts at induction. The caller is told which it got,
+    because a baseline computed against the wrong origin is not a baseline.
+    """
+    seconds, unit = clock_to_seconds(frame[clock_column])
+    if induction_column is not None:
+        origin, _ = clock_to_seconds(frame[induction_column])
+        origin = origin.groupby(frame[patient]).transform("min")
+        note = (f"minutes from the induction time in '{induction_column}' "
+                f"(clock '{clock_column}' read as {unit})")
+    else:
+        origin = seconds.groupby(frame[patient]).transform("min")
+        note = (f"minutes from each patient's FIRST EPOCH in '{clock_column}' "
+                f"(read as {unit}) — not from induction unless the recording "
+                f"starts there")
+    return (seconds - origin) / 60.0, note
 
 
 def pretty_label(column: object) -> str:
@@ -743,6 +801,14 @@ def parse_args() -> argparse.Namespace:
                         help="end of the analysis window")
     parser.add_argument("--baseline-start", type=float, default=-5.0,
                         help="start of the pre-induction baseline window")
+    parser.add_argument("--derive-minutes-from", default=None,
+                        metavar="CLOCK_COLUMN",
+                        help="build a minutes axis from a wall-clock column "
+                             "such as timestamp_local")
+    parser.add_argument("--induction-col", default=None,
+                        help="timestamp of induction, used as the origin for "
+                             "--derive-minutes-from; without it each "
+                             "patient's first epoch is the origin")
     parser.add_argument("--no-window", action="store_true",
                         help="summarise every row, ignoring the time window")
     parser.add_argument("--show-empty-comorbidities", action="store_true",
@@ -774,6 +840,35 @@ def main() -> int:
     print(f"\nTABLE 1 WILL BE WRITTEN TO:\n  {args.outdir.resolve()}")
     print(f"Reading: {args.data}")
 
+    if args.derive_minutes_from:
+        clock = find_column(frame, args.derive_minutes_from)
+        if clock is None:
+            sys.stderr.write(
+                f"\n--derive-minutes-from '{args.derive_minutes_from}' is not "
+                f"a column in this file.\n")
+            return 1
+        induction = None
+        if args.induction_col:
+            induction = find_column(frame, args.induction_col)
+            if induction is None:
+                sys.stderr.write(
+                    f"\n--induction-col '{args.induction_col}' is not a "
+                    f"column in this file.\n")
+                return 1
+        minutes, origin_note = derive_minutes(frame, clock, schema.patient,
+                                              induction)
+        frame["minutes_from_origin"] = minutes
+        schema.time = "minutes_from_origin"
+        print(f"\n  Derived a time axis: {origin_note}")
+        print(f"  It runs {minutes.min():.1f} to {minutes.max():.1f} minutes.")
+        if induction is None:
+            print("  !! Every patient therefore starts at 0, so the "
+                  "pre-induction baseline window is empty\n"
+                  "     and Table 1 falls back to the first epochs after the "
+                  "window start. Pass\n"
+                  "     --induction-col if the file carries a real induction "
+                  "timestamp.")
+
     if args.no_window and schema.time is not None:
         print(f"\n  --no-window: every row is summarised and the time column "
               f"'{schema.time}' is ignored.")
@@ -786,9 +881,19 @@ def main() -> int:
                   "window and there is no baseline section.")
             for line in numeric_column_report(frame, schema.patient):
                 print(f"  {line}")
-            print("  If one of those is the right column, name it with "
-                  "--time-col; otherwise\n  pass --no-window to say so "
-                  "deliberately and silence this notice.")
+            clocks = [str(c) for c in frame.columns
+                      if any(w in normalize(c) for w in
+                             ("timestamp", "datetime", "clock", "utc"))]
+            print("\n  If one of those is the right column, name it with "
+                  "--time-col.")
+            if clocks:
+                print(f"  To build a minutes axis from the wall clock "
+                      f"instead:\n"
+                      f"    python {Path(__file__).name} "
+                      f"--derive-minutes-from {clocks[0]}")
+            print(f"  Or, to summarise every row deliberately and silence "
+                  f"this notice:\n    python {Path(__file__).name} "
+                  f"--no-window")
         window = frame
         window_note = ("every row in the file; no analysis window was applied"
                        if args.no_window else
