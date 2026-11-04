@@ -629,6 +629,65 @@ def describe_schema(frame: pd.DataFrame, schema: Schema, path: Path) -> None:
 # Table 1
 # --------------------------------------------------------------------------- #
 
+def build_coverage(window: pd.DataFrame, schema: Schema,
+                   threshold: float) -> pd.DataFrame:
+    """One row per patient: how much of each signal survives the window.
+
+    'Complete' is defined here as the share of that patient's epochs on which
+    EVERY analysed signal is present. A patient can sit at 99% on each signal
+    separately and still be well below that, because the gaps need not line
+    up — which is the number that decides how many rows a model actually
+    gets, so it is the one reported.
+    """
+    signals = dict(schema.physiology)
+    patients = window[schema.patient]
+    out = pd.DataFrame({"patient": sorted(patients.dropna().unique())})
+    out = out.set_index("patient")
+
+    grouped = window.groupby(schema.patient)
+    out["epochs"] = grouped.size()
+    for key, column in signals.items():
+        out[f"{key}_pct"] = (grouped[column].apply(
+            lambda s: 100.0 * s.notna().mean())).round(1)
+
+    if signals:
+        every = window[list(signals.values())].notna().all(axis=1)
+        complete = every.groupby(patients).sum()
+        out["complete_epochs"] = complete.reindex(out.index).fillna(0).astype(int)
+        out["percent_complete"] = (
+            100.0 * out["complete_epochs"] / out["epochs"]).round(1)
+    else:
+        out["complete_epochs"] = 0
+        out["percent_complete"] = 0.0
+
+    def gaps(row: pd.Series) -> str:
+        names = [PHYSIOLOGY[key]["label"] for key in signals
+                 if row.get(f"{key}_pct", 100.0) < 100.0]
+        return "; ".join(names) if names else ""
+
+    out["signals_with_gaps"] = out.apply(gaps, axis=1)
+    # Three tiers, because the binary hides the distinction that matters. A
+    # patient at 99% and a patient at 0% are both 'not complete', but only the
+    # second one disappears from the analysis entirely.
+    out["status"] = np.where(
+        out["percent_complete"] >= threshold, "Complete",
+        np.where(out["complete_epochs"] > 0, "Partial", "No usable epochs"))
+    return out.reset_index()
+
+
+def format_id_list(ids: list, per_line: int = 6, indent: str = "      ") -> str:
+    """Patient identifiers in aligned columns, so a long list stays readable."""
+    if not ids:
+        return f"{indent}(none)"
+    text = [str(i) for i in ids]
+    pad = max(len(t) for t in text)
+    lines = []
+    for start in range(0, len(text), per_line):
+        chunk = text[start:start + per_line]
+        lines.append(indent + "  ".join(t.ljust(pad) for t in chunk).rstrip())
+    return "\n".join(lines)
+
+
 def build_table1(frame: pd.DataFrame, window: pd.DataFrame, schema: Schema,
                  args: argparse.Namespace) -> tuple[list[tuple[str, str]], str]:
     """Every row of Table 1, as (label, value) pairs."""
@@ -760,6 +819,20 @@ def build_table1(frame: pd.DataFrame, window: pd.DataFrame, schema: Schema,
         rows.append(("Patients contributing a complete epoch",
                      f"{complete[schema.patient].nunique()} of {patients}"))
 
+        coverage = build_coverage(window, schema, args.coverage_threshold)
+        whole = int((coverage["status"] == "Complete").sum())
+        part = int((coverage["status"] == "Partial").sum())
+        none = int((coverage["status"] == "No usable epochs").sum())
+        rows.append(("Patients with no missing data at all",
+                     f"{whole} of {patients} "
+                     f"({100 * whole / max(patients, 1):.0f}%)"))
+        rows.append(("Patients with some epochs usable",
+                     f"{part} of {patients}"))
+        rows.append(("Patients with no usable epoch",
+                     f"{none} of {patients}"))
+        rows.append(("Usable epochs per patient, median (IQR)",
+                     describe_numeric(coverage["complete_epochs"], 0)))
+
     return rows, baseline_note
 
 
@@ -883,6 +956,12 @@ def parse_args() -> argparse.Namespace:
                              "patient's first epoch is the origin")
     parser.add_argument("--no-window", action="store_true",
                         help="summarise every row, ignoring the time window")
+    parser.add_argument("--coverage-threshold", type=float, default=100.0,
+                        help="percent of a patient's epochs that must carry "
+                             "every signal for that patient to count as "
+                             "complete")
+    parser.add_argument("--full-coverage-list", action="store_true",
+                        help="print every incomplete patient, not the worst 25")
     parser.add_argument("--show-empty-comorbidities", action="store_true",
                         help="keep history rows that no patient has")
     parser.add_argument("--inspect", action="store_true",
@@ -1029,6 +1108,64 @@ def main() -> int:
     csv_path = args.outdir / "table1_patient_characteristics.csv"
     pd.DataFrame(flat).to_csv(csv_path, index=False)
     print(f"\n  wrote {csv_path}")
+
+    # ---- per-patient coverage, with the identifiers named -------------------
+    if schema.physiology:
+        coverage = build_coverage(window, schema, args.coverage_threshold)
+        done = coverage.loc[coverage["status"] == "Complete"]
+        partial = coverage.loc[coverage["status"] == "Partial"]
+        dropped = coverage.loc[coverage["status"] == "No usable epochs"]
+
+        print("\n" + "=" * 78)
+        print("DATA COVERAGE BY PATIENT")
+        print("=" * 78)
+        print("  Usable means every signal is present on that epoch. Gaps "
+              "in different\n  signals need not fall on the same epochs, so "
+              "a patient can be high on each\n  signal separately and lower "
+              "here.\n")
+        tiers = ((f"Complete ({args.coverage_threshold:g}% of epochs usable)",
+                  len(done)),
+                 ("Partial (some epochs usable)", len(partial)),
+                 ("No usable epochs", len(dropped)))
+        label_width = max(len(label) for label, _ in tiers)
+        for label, count in tiers:
+            print(f"  {label:<{label_width}} : {count:>3} of {len(coverage)}")
+
+        print(f"\n  COMPLETE — nothing missing ({len(done)}):")
+        print(format_id_list(list(done["patient"])))
+
+        print(f"\n  NOT COMPLETE ({len(partial) + len(dropped)}):")
+        # Taken from the coverage frame, which is already in patient order:
+        # re-sorting would put '10' before '2'.
+        print(format_id_list(list(
+            coverage.loc[coverage["status"] != "Complete", "patient"])))
+
+        if not dropped.empty:
+            print(f"\n  !! NO USABLE EPOCH AT ALL ({len(dropped)}). Any model "
+                  f"needing every signal at\n     once drops these patients "
+                  f"entirely:")
+            print(format_id_list(list(dropped["patient"])))
+
+        not_complete = pd.concat([partial, dropped])
+        if not not_complete.empty:
+            shown = not_complete.sort_values("percent_complete")
+            cap = len(shown) if args.full_coverage_list else 25
+            print("\n  Why, worst first"
+                  + ("" if cap >= len(shown)
+                     else f" (first {cap} of {len(shown)}; all of them are in "
+                          f"the CSV)") + ":")
+            print(f"      {'Patient':<16}{'Epochs':>8}{'Usable':>8}"
+                  f"{'Usable %':>10}  Signals with gaps")
+            for _, row in shown.head(cap).iterrows():
+                print(f"      {str(row['patient']):<16}"
+                      f"{row['epochs']:>8,}"
+                      f"{row['complete_epochs']:>8,}"
+                      f"{row['percent_complete']:>9.1f}%  "
+                      f"{row['signals_with_gaps'] or '—'}")
+
+        coverage_path = args.outdir / "patient_data_coverage.csv"
+        coverage.to_csv(coverage_path, index=False)
+        print(f"\n  wrote {coverage_path}")
 
     if not args.no_png:
         grid = [["Characteristic", f"Value (n = {patients})"]]
