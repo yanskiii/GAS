@@ -55,6 +55,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.font_manager import FontProperties
+from matplotlib.patches import Rectangle
+from matplotlib.textpath import TextPath
 
 # The analysis dataset the mixed models are fitted on.
 DEFAULT_DATA = Path(
@@ -752,18 +755,25 @@ def build_table1(frame: pd.DataFrame, window: pd.DataFrame, schema: Schema,
     if schema.time is not None:
         before = frame.loc[(frame[schema.time] >= args.baseline_start)
                            & (frame[schema.time] < args.window_start)]
+        # The heading carries the short form and the footnote the full one.
+        # Spelling the whole caveat in the heading stretched every column in
+        # the rendered table to the width of that one sentence.
         if not before.empty and before[schema.patient].nunique() >= patients * 0.5:
             source = before
+            heading = (f"Baseline physiology "
+                       f"({args.baseline_start:g} to {args.window_start:g} min, "
+                       f"before induction)")
             baseline_note = (f"mean of each patient's epochs from "
                              f"{args.baseline_start:g} to {args.window_start:g} "
                              f"min, before induction")
         else:
             source = (window.sort_values(schema.time)
                       .groupby(schema.patient).head(3))
+            heading = "Baseline physiology (NOT a true baseline — see note)"
             baseline_note = ("mean of each patient's first three epochs after "
                              "induction; the file carries no pre-induction "
                              "window, so this is NOT a true baseline")
-        section(f"Baseline physiology ({baseline_note})")
+        section(heading)
         if not schema.physiology:
             rows.append(("No physiology columns found", ""))
         for key, column in schema.physiology.items():
@@ -840,53 +850,191 @@ def build_table1(frame: pd.DataFrame, window: pd.DataFrame, schema: Schema,
 # Writing it out
 # --------------------------------------------------------------------------- #
 
-def render_table(rows: list[list[str]], widths: list[int], title: str,
-                 footnote: str, path: Path,
-                 section_rows: frozenset[int] = frozenset()) -> None:
-    """Draw the table as an image, in a monospace grid that survives any cell."""
-    body_size, note_size = 9.2, 8.2
-    line = body_size * 1.55 / 72.0
-    note_lines = footnote.count("\n") + 1 if footnote else 0
-    height = (0.55 + line * (len(rows) + 1)
-              + note_size * 1.5 / 72.0 * note_lines + 0.45)
-    character = body_size * 0.62 / 72.0
-    width = max(character * (sum(widths) + 2 * (len(widths) - 1)),
-                max((len(part) for part in footnote.split("\n")), default=0)
-                * note_size * 0.52 / 72.0, 6.0) + 0.6
+# Palette for the rendered table. Dark enough to survive a projector.
+INK = "#15202B"
+SECTION_INK = "#1F4E79"
+SECTION_BAND = "#E4EDF6"
+STRIPE = "#F5F7FA"
+RULE = "#9FB0C2"
+MUTED = "#5A6673"
 
-    figure = plt.figure(figsize=(width, max(height, 2.5)))
+TITLE_SIZE = 16.0
+HEAD_SIZE = 11.0
+BODY_SIZE = 11.0
+SECTION_SIZE = 11.5
+NOTE_SIZE = 9.0
+
+
+def text_width(text: str, size: float, weight: str = "normal") -> float:
+    """Width of a piece of text in inches, measured rather than guessed.
+
+    A proportional font is far easier to read on a projector than the
+    monospace grid this used to draw, but it makes column widths impossible to
+    estimate from character counts: 'Hyperlipidemia' and 'MAP, mmHg' are 14 and
+    9 characters and nothing like that ratio on screen. TextPath measures the
+    glyphs that will actually be drawn, so the value column lands just past the
+    longest label instead of wherever a guess put it.
+    """
+    if not text:
+        return 0.0
+    prop = FontProperties(family="DejaVu Sans", size=size, weight=weight)
+    return float(TextPath((0, 0), text, prop=prop).get_extents().width) / 72.0
+
+
+MARGIN = 0.34
+INDENT = 0.30
+GUTTER = 0.55
+COLUMN_GAP = 0.75
+
+
+def block_metrics(rows: list[dict], subtitle: str) -> tuple[float, float]:
+    """Label and value column widths, in inches, for one block of rows."""
+    label_width = text_width("Characteristic", HEAD_SIZE, "bold")
+    value_width = text_width(subtitle, HEAD_SIZE, "bold")
+    for row in rows:
+        kind = row["kind"]
+        size = SECTION_SIZE if kind == "section" else BODY_SIZE
+        weight = "bold" if kind == "section" else "normal"
+        extra = INDENT if kind == "sub" else 0.0
+        label_width = max(label_width,
+                          text_width(row["label"], size, weight) + extra)
+        value_width = max(value_width,
+                          text_width(row.get("value", ""), BODY_SIZE))
+    return label_width, value_width
+
+
+def block_height(rows: list[dict], row_h: float, section_h: float) -> float:
+    return sum(section_h if row["kind"] == "section" else row_h
+               for row in rows)
+
+
+def split_rows(rows: list[dict], row_h: float,
+               section_h: float) -> tuple[list[dict], list[dict]]:
+    """Cut the table in two at the section boundary nearest to half its height.
+
+    Splitting on row COUNT would cut a section in half, so a heading could end
+    up at the foot of one column with its rows at the head of the next. Cutting
+    only at a boundary keeps every section whole, and choosing the boundary by
+    height rather than count keeps the two columns close to level.
+    """
+    total = block_height(rows, row_h, section_h)
+    best_index, best_gap = None, None
+    running = 0.0
+    for index, row in enumerate(rows):
+        if index > 0 and row["kind"] == "section":
+            gap = abs(running - total / 2.0)
+            if best_gap is None or gap < best_gap:
+                best_index, best_gap = index, gap
+        running += section_h if row["kind"] == "section" else row_h
+    if best_index is None:
+        return rows, []
+    return rows[:best_index], rows[best_index:]
+
+
+def render_table(rows: list[dict], title: str, subtitle: str,
+                 notes: list[str], path: Path,
+                 layout: str = "auto") -> None:
+    """Draw Table 1 as a banded table, sized to its own contents.
+
+    Each row is {"kind": "section" | "item" | "sub", "label", "value"}. With
+    two columns the table is roughly half as tall and twice as wide, which is
+    what fits on a projected slide; a single tall column is right for a page.
+    """
+    row_h = BODY_SIZE * 2.05 / 72.0
+    section_h = SECTION_SIZE * 2.5 / 72.0
+    head_h = HEAD_SIZE * 2.4 / 72.0
+    note_h = NOTE_SIZE * 1.9 / 72.0
+
+    two = (layout == "two-column"
+           or (layout == "auto" and len(rows) > 34))
+    blocks = [rows]
+    if two:
+        left, right = split_rows(rows, row_h, section_h)
+        blocks = [left, right] if right else [left]
+
+    metrics = [block_metrics(block, subtitle) for block in blocks]
+    block_widths = [label + GUTTER + value for label, value in metrics]
+    body = max(block_height(block, row_h, section_h) for block in blocks)
+
+    width = max(
+        MARGIN * 2 + sum(block_widths) + COLUMN_GAP * (len(blocks) - 1),
+        MARGIN * 2 + text_width(title, TITLE_SIZE, "bold"),
+        MARGIN * 2 + max((text_width(n, NOTE_SIZE) for n in notes),
+                         default=0.0))
+    top_block = 0.30 + TITLE_SIZE / 72.0 + 0.26
+    height = (top_block + head_h + body + 0.22
+              + note_h * len(notes) + 0.26)
+
+    figure = plt.figure(figsize=(width, height))
+    figure.patch.set_facecolor("white")
     axis = figure.add_axes([0.0, 0.0, 1.0, 1.0])
+    axis.set_xlim(0.0, width)
+    axis.set_ylim(0.0, height)
+    axis.invert_yaxis()          # draw downward, like reading order
     axis.axis("off")
-    top = 1.0 - 0.18 / height
-    axis.text(0.025, top, title, fontsize=12.5, fontweight="bold",
-              va="top", ha="left", transform=axis.transAxes)
 
-    def render(cells: list[str]) -> str:
-        return "  ".join(str(cell).ljust(w)[:max(w, 1)]
-                         for cell, w in zip(cells, widths))
+    def rule(y: float, x0: float, x1: float, lw: float, colour: str) -> None:
+        axis.plot([x0, x1], [y, y], color=colour, linewidth=lw,
+                  solid_capstyle="butt")
 
-    y = top - 0.42 / height
-    for index, cells in enumerate(rows):
-        weight, colour = ("bold", "#1A1A1A") if index == 0 else ("normal",
-                                                                 "#1A1A1A")
-        if index in section_rows:
-            weight, colour = "bold", "#20496B"
-        axis.text(0.025, y, render(cells), fontsize=body_size,
-                  family="monospace", va="top", ha="left", color=colour,
-                  fontweight=weight, transform=axis.transAxes)
-        y -= line / height
-        if index == 0:
-            axis.text(0.025, y, "-" * (sum(widths) + 2 * (len(widths) - 1)),
-                      fontsize=body_size, family="monospace", va="top",
-                      ha="left", transform=axis.transAxes)
-            y -= line / height
-    if footnote:
-        axis.text(0.025, 0.16 / height, footnote, fontsize=note_size,
-                  va="bottom", ha="left", color="#444444",
-                  transform=axis.transAxes, linespacing=1.45)
-    figure.savefig(path, dpi=200)
+    y_title = 0.30
+    axis.text(MARGIN, y_title, title, fontsize=TITLE_SIZE, fontweight="bold",
+              color=INK, va="top", ha="left")
+    y_top = y_title + TITLE_SIZE / 72.0 + 0.26
+
+    x = MARGIN
+    for block, (label_width, value_width) in zip(blocks, metrics):
+        block_w = label_width + GUTTER + value_width
+        value_x = x + label_width + GUTTER
+        y = y_top
+
+        rule(y, x, x + block_w, 1.4, INK)
+        axis.text(x, y + head_h / 2.0, "Characteristic", fontsize=HEAD_SIZE,
+                  fontweight="bold", color=INK, va="center", ha="left")
+        axis.text(value_x, y + head_h / 2.0, subtitle, fontsize=HEAD_SIZE,
+                  fontweight="bold", color=INK, va="center", ha="left")
+        y += head_h
+        rule(y, x, x + block_w, 1.0, INK)
+
+        stripe = False
+        for row in block:
+            kind = row["kind"]
+            if kind == "section":
+                axis.add_patch(Rectangle((x, y), block_w, section_h,
+                                         facecolor=SECTION_BAND,
+                                         edgecolor="none", zorder=0))
+                axis.text(x + 0.10, y + section_h / 2.0, row["label"],
+                          fontsize=SECTION_SIZE, fontweight="bold",
+                          color=SECTION_INK, va="center", ha="left")
+                y += section_h
+                stripe = False
+                continue
+            if stripe:
+                axis.add_patch(Rectangle((x, y), block_w, row_h,
+                                         facecolor=STRIPE, edgecolor="none",
+                                         zorder=0))
+            stripe = not stripe
+            left = x + (INDENT if kind == "sub" else 0.0)
+            axis.text(left, y + row_h / 2.0, row["label"], fontsize=BODY_SIZE,
+                      color=MUTED if kind == "sub" else INK,
+                      va="center", ha="left")
+            axis.text(value_x, y + row_h / 2.0, row.get("value", ""),
+                      fontsize=BODY_SIZE, color=INK, va="center", ha="left")
+            y += row_h
+
+        rule(y, x, x + block_w, 1.4, INK)
+        x += block_w + COLUMN_GAP
+
+    y = y_top + head_h + body + 0.42
+    for note in notes:
+        axis.text(MARGIN, y, note, fontsize=NOTE_SIZE, color=MUTED,
+                  va="top", ha="left")
+        y += note_h
+
+    figure.savefig(path, dpi=200, facecolor="white")
     plt.close(figure)
-    print(f"  wrote {path}")
+    print(f"  wrote {path}  ({width:.1f} x {height:.1f} in, "
+          f"{len(blocks)} column{'s' if len(blocks) > 1 else ''})")
 
 
 def load_frame(path: Path) -> pd.DataFrame:
@@ -960,6 +1108,10 @@ def parse_args() -> argparse.Namespace:
                         help="percent of a patient's epochs that must carry "
                              "every signal for that patient to count as "
                              "complete")
+    parser.add_argument("--layout", default="auto",
+                        choices=("auto", "single", "two-column"),
+                        help="PNG layout; two columns fit a slide, one tall "
+                             "column fits a page")
     parser.add_argument("--full-coverage-list", action="store_true",
                         help="print every incomplete patient, not the worst 25")
     parser.add_argument("--show-empty-comorbidities", action="store_true",
@@ -1168,25 +1320,35 @@ def main() -> int:
         print(f"\n  wrote {coverage_path}")
 
     if not args.no_png:
-        grid = [["Characteristic", f"Value (n = {patients})"]]
-        sections: set[int] = set()
+        drawn: list[dict] = []
         for key, value in table:
             if key.startswith("__SECTION__"):
-                sections.add(len(grid))
-                grid.append([key.replace("__SECTION__", "").upper(), ""])
+                drawn.append({"kind": "section",
+                              "label": key.replace("__SECTION__", ""),
+                              "value": ""})
+            elif key.startswith("    "):
+                drawn.append({"kind": "sub", "label": key.strip(),
+                              "value": value})
             else:
-                grid.append([key, value])
-        widths = [max(len(r[0]) for r in grid), max(len(r[1]) for r in grid)]
+                drawn.append({"kind": "item", "label": key, "value": value})
+
+        notes = [
+            "Numeric values are median (IQR), computed once per patient.",
+            "Medication rows are patients exposed (%) followed by the dose "
+            "distribution among those exposed only.",
+            f"Analysis window: {window_note}.",
+            f"Baseline is the {baseline_note}.",
+            "Usable means every signal is present on that epoch; gaps in "
+            "different signals need not fall on the same epochs.",
+        ]
         render_table(
-            grid, widths,
+            drawn,
             "Table 1. Patient characteristics, baseline physiology, "
             "medication exposure and signal completeness",
-            "Numeric values are median (IQR), computed once per patient.\n"
-            "Medication rows are patients exposed (%) followed by the dose "
-            "distribution among those exposed only.\n"
-            f"Analysis window: {window_note}. Baseline is the {baseline_note}.",
+            f"Value (n = {patients})",
+            notes,
             args.outdir / "table1_patient_characteristics.png",
-            section_rows=frozenset(sections))
+            layout=args.layout)
 
     return 0
 
